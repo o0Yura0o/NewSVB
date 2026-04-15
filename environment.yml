@@ -1,0 +1,59 @@
+name: NSVB-ZH
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    # ── PyTorch (CUDA 12.1，與原 NSVB 環境相同版本) ──────────────────
+    # 安裝前請先執行：
+    #   pip install torch==2.4.1+cu121 torchaudio==2.4.1+cu121 torchvision==0.19.1+cu121
+    #   --index-url https://download.pytorch.org/whl/cu121
+    - pytorch-lightning==1.9.5
+
+    # ── 核心數值與音頻 ─────────────────────────────────────────────
+    - numpy==1.26.4
+    - scipy==1.13.0
+    - librosa==0.10.2
+    - soundfile==0.12.1
+    - pyloudnorm==0.1.1
+    - pyworld==0.3.4
+    - praat-parselmouth==0.4.3
+    - webrtcvad==2.0.10
+    - resampy==0.4.3
+    - einops==0.8.0
+
+    # ── 語音與語言處理 ────────────────────────────────────────────
+    - resemblyzer==0.1.4
+    - pypinyin==0.53.0
+    - g2pM==0.1.2.5
+    - jieba==0.42.1
+    - pycwt==0.4.0b0
+
+    # ── Hugging Face 生態（中文 ASR / 資料集下載）─────────────────
+    - transformers==4.40.0
+    - huggingface-hub==0.24.0
+    - tokenizers==0.19.1
+    - datasets==2.20.0
+    - accelerate==0.30.0
+
+    # ── 資料處理 ────────────────────────────────────────────────
+    - pandas==2.2.2
+    - openpyxl==3.1.5       # 讀取 VocalVerse .xlsx 標注檔
+    - textgrid==1.6.1        # MFA 強制對齊輸出解析
+
+    # ── 訓練與視覺化 ─────────────────────────────────────────────
+    - tensorboard==2.17.0
+    - tensorboardx==2.6.2.2
+    - tqdm==4.66.4
+
+    # ── 工具 ────────────────────────────────────────────────────
+    - pyyaml==6.0.2
+    - scikit-learn==1.5.1
+    - scikit-image==0.24.0
+    - pillow==10.4.0
+    - matplotlib==3.9.1
+    - portalocker==2.10.1
+    - filelock==3.15.4
+    - tabulate==0.9.0
