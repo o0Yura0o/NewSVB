@@ -24,6 +24,16 @@ dependencies:
     - resampy==0.4.3
     - einops==0.8.0
 
+    # ── F0 抽取 (Phase 0 必要)：torchcrepe ─────────────────
+    # nsvb/data/feature_extract/f0_torchcrepe.py 用 torchcrepe.predict 抽 F0；
+    # 不裝這個 binarizer 會在第一首歌就 ImportError
+    - torchcrepe==0.0.24
+
+    # ── 去殘響+去噪 (Phase 0 主防線, Risk 2)：DeepFilterNet ─
+    # nsvb/utils/audio_io.py 的 dereverb_wav() 用；binarizer 預設 dereverb=True
+    # 必開（Risk 2 主防線——把音質基線拉齊，逼 M 學真正的技術差）
+    - deepfilternet==0.5.6
+
     # ── 語音與語言處理 ────────────────────────────────────────────
     - resemblyzer==0.1.4
     - pypinyin==0.53.0

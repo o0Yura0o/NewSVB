@@ -1,0 +1,30 @@
+{
+  "vocoder_ckpt": "C:\\Users\\neo29\\workspace\\SVC\\NSVB\\checkpoints\\1012_hifigan_all_songs_nsf\\model_ckpt_steps_1170000.ckpt",
+  "thresholds": {
+    "ssim_pass": 0.9,
+    "ssim_marginal": 0.85,
+    "f0_rmse_pass": 10.0,
+    "f0_rmse_marginal": 20.0
+  },
+  "results": {
+    "nsvb_native": {
+      "n_files": 1,
+      "mel_ssim_mean": 0.35461598118610443,
+      "mel_ssim_std": 0.0,
+      "f0_rmse_mean": 8.631936073303223,
+      "f0_rmse_std": 0.0,
+      "verdict": "FAIL",
+      "per_file": [
+        {
+          "wav_path": "C:\\Users\\neo29\\workspace\\SVC\\NSVB\\checkpoints\\AMe_ref_PM\\generated_0_\\wavs\\gt_p_wavout\\[000000][RAW#singing#_RAWTEST_Amateur_seg0][P].wav",
+          "duration_sec": 7.203990929705215,
+          "mel_ssim": 0.35461598118610443,
+          "f0_rmse_hz": 8.631936073303223,
+          "voicing_iou": 0.9264836138175376,
+          "saved_gt": "outputs\\sanity_22k_native\\wavs\\nsvb_native\\[000000][RAW#singing#_RAWTEST_Amateur_seg0][P]__gt.wav",
+          "saved_recon": "outputs\\sanity_22k_native\\wavs\\nsvb_native\\[000000][RAW#singing#_RAWTEST_Amateur_seg0][P]__recon.wav"
+        }
+      ]
+    }
+  }
+}

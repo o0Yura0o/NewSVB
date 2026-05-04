@@ -34,3 +34,5 @@ build/
 *.tmp
 *.log
 *.bak
+
+*.pptx

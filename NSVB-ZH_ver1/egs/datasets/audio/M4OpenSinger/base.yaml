@@ -1,0 +1,97 @@
+# NSVB-ZH base config for M4Singer + OpenSinger
+# Extends the original repo's egs/egs_bases/vc/vc_ppg.yaml
+# Drop this file at egs/datasets/audio/M4OpenSinger/base.yaml and inherit from it.
+
+base_config:
+  - egs/egs_bases/vc/vc_ppg.yaml
+
+# ----------------------------------------------------------------------------
+# Data
+# ----------------------------------------------------------------------------
+raw_data_dir: ''                         # set per-dataset in stage configs
+processed_data_dir: 'data/processed/m4opensinger'
+binary_data_dir: 'data/binary/m4opensinger'
+
+# Chinese text processor
+pre_align_args:
+  txt_processor: zh
+  use_tone: true
+  allow_no_txt: true                     # M4Singer has lyrics; OpenSinger may lack
+  sil_phonemes: ['|', 'SP', 'SIL']
+  nsample_per_mfa_group: 1000
+
+# Audio (match the HifiGAN NSF vocoder that was pretrained)
+audio_sample_rate: 22050
+audio_num_mel_bins: 80
+fft_size: 512
+hop_size: 128
+win_size: 512
+fmin: 50
+fmax: 11025
+
+# Binarizer
+binarizer_cls: data_gen.singing.binarize_nsvb_zh.NsvbZhBinarizer
+binarization_args:
+  shuffle: true
+  with_spk_embed: true
+  with_f0: true
+  with_f0cwt: false
+  with_word: true
+  with_linear: false
+  with_wav: false
+  trim_eos_bos: false
+
+# Mark each sample with its dataset so the task can route batches.
+dataset_labels:
+  m4singer: 0        # "amateur" side (for Stage 2 routing)
+  opensinger: 1      # "pro" side (Phase 0 probe will verify this mapping)
+
+# ----------------------------------------------------------------------------
+# Shared model hparams (CVAE)
+# ----------------------------------------------------------------------------
+fvae_latent_size: 192
+fvae_encoder_type: 'fvae_encoder'
+fvae_decoder_type: 'fvae_decoder'
+
+# ----------------------------------------------------------------------------
+# NSVB-ZH specific switches — override in stage configs
+# ----------------------------------------------------------------------------
+task_stage: 'stage1'
+use_grl: false
+
+# Stage 2 placeholders (set properly in stage2_mapping.yaml)
+m_kernel_size: 1
+m_hidden_dim: 256
+m_num_layers: 4
+d_z_warmup_steps: 5000
+
+# Conditional D_z
+soft_bucket_num: 5
+soft_bucket_sigma: 0.3
+phoneme_vocab_size: 80                   # CHECK against your zh dict size
+phoneme_embed_dim: 32
+dz_hidden_dim: 256
+dz_num_layers: 4
+
+# TTUR (Heusel et al. 2017)
+opt_m_lr: 1.0e-4
+opt_dz_lr: 4.0e-4
+opt_dmel_lr: 1.0e-5
+opt_patchnce_lr: 1.0e-4
+
+# Loss weights
+lambda_adv_z: 1.0
+lambda_adv_mel: 0.2
+lambda_patchnce: 1.0
+lambda_ppg: 0.5
+lambda_identity_pro: 0.1
+identity_pro_prob: 0.2
+
+# Misc
+freeze_cvae_in_stage2: true
+ppg_extractor_ckpt: ''                   # SET to your Chinese PPG ckpt
+
+# ----------------------------------------------------------------------------
+# Task class
+# ----------------------------------------------------------------------------
+task_cls: tasks.singing.nsvb_zh_task.NsvbZhTask

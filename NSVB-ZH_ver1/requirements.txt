@@ -1,0 +1,6 @@
+# Additional requirements on top of the original NSVB environment.
+# The original repo already pins: torch, pytorch-lightning, librosa, pyworld,
+# numpy, tqdm, etc. These are the extras for NSVB-ZH.
+
+scikit-learn>=1.0        # Phase 0 probe: logistic regression
+scikit-image>=0.19       # vocoder identity test: mel SSIM

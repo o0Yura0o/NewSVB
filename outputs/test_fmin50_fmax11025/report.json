@@ -1,0 +1,39 @@
+{
+  "vocoder_ckpt": "C:\\Users\\neo29\\workspace\\SVC\\NSVB\\checkpoints\\1012_hifigan_all_songs_nsf\\model_ckpt_steps_1170000.ckpt",
+  "thresholds": {
+    "ssim_pass": 0.9,
+    "ssim_marginal": 0.85,
+    "f0_rmse_pass": 10.0,
+    "f0_rmse_marginal": 20.0
+  },
+  "results": {
+    "origin": {
+      "n_files": 2,
+      "mel_ssim_mean": 0.9415491701746932,
+      "mel_ssim_std": 0.002806750008022052,
+      "f0_rmse_mean": 5.797697305679321,
+      "f0_rmse_std": 1.1351373195648193,
+      "verdict": "PASS",
+      "per_file": [
+        {
+          "wav_path": "outputs\\test_origin_gt\\origin_amateur_input.wav",
+          "duration_sec": 3.953197278911565,
+          "mel_ssim": 0.9387424201666712,
+          "f0_rmse_hz": 6.932834625244141,
+          "voicing_iou": 0.9722703639514731,
+          "saved_gt": "outputs\\test_fmin50_fmax11025\\wavs\\origin\\origin_amateur_input__gt.wav",
+          "saved_recon": "outputs\\test_fmin50_fmax11025\\wavs\\origin\\origin_amateur_input__recon.wav"
+        },
+        {
+          "wav_path": "outputs\\test_origin_gt\\origin_pro_input.wav",
+          "duration_sec": 4.046077097505669,
+          "mel_ssim": 0.9443559201827153,
+          "f0_rmse_hz": 4.662559986114502,
+          "voicing_iou": 0.9639175257731959,
+          "saved_gt": "outputs\\test_fmin50_fmax11025\\wavs\\origin\\origin_pro_input__gt.wav",
+          "saved_recon": "outputs\\test_fmin50_fmax11025\\wavs\\origin\\origin_pro_input__recon.wav"
+        }
+      ]
+    }
+  }
+}

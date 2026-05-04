@@ -1,0 +1,30 @@
+{
+  "vocoder_ckpt": "C:\\Users\\neo29\\workspace\\SVC\\NSVB\\checkpoints\\1012_hifigan_all_songs_nsf\\model_ckpt_steps_1170000.ckpt",
+  "thresholds": {
+    "ssim_pass": 0.9,
+    "ssim_marginal": 0.85,
+    "f0_rmse_pass": 10.0,
+    "f0_rmse_marginal": 20.0
+  },
+  "results": {
+    "popbutfy": {
+      "n_files": 1,
+      "mel_ssim_mean": 0.3913000007129573,
+      "mel_ssim_std": 0.0,
+      "f0_rmse_mean": 13.222969055175781,
+      "f0_rmse_std": 0.0,
+      "verdict": "FAIL",
+      "per_file": [
+        {
+          "wav_path": "C:\\Users\\neo29\\workspace\\SVC\\NSVB\\data\\processed\\PopBuTFy_new\\data\\Female12#singing#Hello_Professional\\Female12#singing#Hello_Professional_7.wav",
+          "duration_sec": 12.68390022675737,
+          "mel_ssim": 0.3913000007129573,
+          "f0_rmse_hz": 13.222969055175781,
+          "voicing_iou": 0.9724972497249725,
+          "saved_gt": "outputs\\sanity_popbutfy\\wavs\\popbutfy\\Female12#singing#Hello_Professional_7__gt.wav",
+          "saved_recon": "outputs\\sanity_popbutfy\\wavs\\popbutfy\\Female12#singing#Hello_Professional_7__recon.wav"
+        }
+      ]
+    }
+  }
+}
