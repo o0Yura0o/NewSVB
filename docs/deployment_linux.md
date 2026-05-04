@@ -144,6 +144,20 @@ du -sh data/*  # VocalVerse 約 80 GB，m4singer 約 30 GB
 
 ## 5. Phase 0 — 資料前處理（gate 階段，必須全部 PASS 才進 Phase 1）
 
+### Risk 2 防線總覽（重要）
+
+NSVB-ZH 最大的訓練風險是 **Risk 2 — 音質域與技術域混淆**：M4Singer（錄音室）vs VocalVerse（user-generated）的錄音環境差異可能讓 M 學成「降噪/去殘響濾波器」而非「修技術」。Phase 0 / Phase 2 的多層機制都是為了防這件事，**全部都已寫進 codebase**：
+
+| 層級 | 在哪裡 | 做什麼 | 預設狀態 |
+|---|---|---|---|
+| **L1 採樣率 + 響度正規化** | [audio_io.loudness_normalize](../nsvb/utils/audio_io.py) | 22050 Hz / -22 LUFS | 必開（binarize 內建） |
+| **L2 DeepFilterNet3 dereverb + denoise** ⭐ | [audio_io.dereverb_wav](../nsvb/utils/audio_io.py) | 對兩 dataset 都跑（不是只 amateur） | **必開**（binarize 預設） |
+| **L3 z 層解耦** | Stage 1 CVAE | 錄音環境差異被 mel 層吸收 | 自動 |
+| **L4 Phase 0 audio quality probe** ⭐ | [scripts/audio_quality_probe.py](../scripts/audio_quality_probe.py) | SFM / Reverb / HF-ratio / SNR 的 JSD 必須 < 0.10 | **必跑**（gate） |
+| **L5 訓中 audio quality monitor** | [Stage2Trainer.monitor_audio_quality](../nsvb/task/stage2.py) | 每 5000 步抽樣計算 unvoiced_concentration | 訓練自動 |
+
+**為什麼 dereverb 對兩個 dataset 都做**：只對 amateur 端 dereverb 會引入新的「兩邊處理不一致」差異，反而讓 D_z 學到「有沒有過 dereverb」這個捷徑。處理後 M4Singer 仍是乾淨的（dereverb 對乾淨輸入近乎 noop），但統計上保證兩邊走過同一條 pipeline。
+
 ### 5.1 Vocoder identity test（dealbreaker）
 
 驗證 NSVB 原作者的 HifiGAN 能不能重建中文歌聲 mel：
@@ -161,7 +175,7 @@ python -m scripts.vocoder_identity_test \
 
 > 不過則 vocoder 要在中文歌聲上 fine-tune（不在本指南範圍）；不過不能跳過——後續 M 的所有改進都會被 vocoder 重建誤差掩蓋。
 
-### 5.2 Audio quality probe（兩 dataset 音質統計差距）
+### 5.2 Audio quality probe（Risk 2 L4 — 兩 dataset 音質統計差距）
 
 ```bash
 python -m scripts.audio_quality_probe \
@@ -170,14 +184,23 @@ python -m scripts.audio_quality_probe \
     --out-dir outputs/phase0_audio_quality
 ```
 
-**通過條件**：所有 metric (SFM / Reverb / HF-ratio / SNR) 的 JSD < 0.10。
+**通過條件**：所有 metric 的 JSD < 0.10：
+- **SFM**（spectral flatness）— 估計訊號 vs 白噪音的相似度（高表示噪音含量大）
+- **Reverb**（estimated direct-to-reverberant ratio）— 估計殘響量
+- **HF-ratio**（high-frequency energy ratio）— 估計頻譜亮度
+- **SNR**（estimated SNR via ITU-R P.56）— 估計訊噪比
 
-> 不過則 binarizer 一定要開 dereverb（預設就開）；嚴重不過時要在外部做 SNR 篩選把過糟的 amateur 樣本拿掉。
+**不過時的處理**：
+1. **首選**：確認 binarizer 是用預設 `dereverb=True`（**不要加 `--no-dereverb`**）；dereverb 通常能把 reverb / SNR JSD 拉進 0.10 內
+2. 仍不過：在外部做 SNR 篩選，把 VocalVerse 過糟的樣本拿掉再 binarize
+3. 嚴重不過（JSD > 0.20）：考慮換更乾淨的 amateur dataset，或顯著縮小選曲（同類型 / 同錄音環境）
 
-### 5.3 Binarize 兩個 dataset
+> 跑這支 probe 對 raw wav（dereverb 前），是為了知道**原始**差距；binarize 後實際進 model 的是 dereverb 過的 wav，差距會更小。
+
+### 5.3 Binarize 兩個 dataset（Risk 2 L1 + L2 — dereverb + 響度正規化）
 
 ```bash
-# Pro side：M4Singer
+# Pro side：M4Singer（注意：不加 --no-dereverb，要對兩邊都做 dereverb）
 python -m nsvb.data.binarizer \
     --dataset m4singer \
     --data-root data \
@@ -192,7 +215,15 @@ python -m nsvb.data.binarizer \
 
 每首歌會產出一個 `data/binarized/{dataset}/{item_id}.npz`。**會跑很久**（~3-5 秒/歌 × 8000 首 ≈ 8–14 小時）。可以中斷，重跑會自動 skip 已存在的。
 
+> **不要加 `--no-dereverb`**——這會違反 Risk 2 主防線。`--no-dereverb` 只在 vocoder identity test、smoke test、或刻意做「無 dereverb」對照實驗時才用。
+
+> binarizer 內部執行順序：`load → dereverb → loudness norm → mel`（[audio_io.load_and_extract](../nsvb/utils/audio_io.py)）。
+> dereverb 必須在 loudness norm 之前，否則殘響會被算進 LUFS 統計、dereverb 後音量會偏低。
+
 > 速度監控：開另一個 terminal `watch -n 5 'ls data/binarized/m4singer | wc -l'`。
+>
+> DeepFilterNet3 model 第一次跑會自動下載到 `~/.cache/DeepFilterNet/`（~50 MB，需要外網）；
+> 離線機器要事先在有網路的機器上跑一次 `python -c "from df.enhance import init_df; init_df()"` 然後把 cache 目錄拷貝過去。
 
 ### 5.4 PPG k-means → phoneme_id
 
@@ -346,6 +377,44 @@ stage2: 12%|############| 14400/120000 [2:11:42<16:08:50, 1.81it/s, m=0.821, d_z
 - `delta_over_z`（‖Δ‖/‖z‖；不應 > 0.30，否則 M 改太多）
 - `unvoiced_concentration`（每 5000 步的音質監控；< 0.55 良好，> 0.65 警訊代表 M 在去殘響）
 
+#### 7.2.1 訓中音質監控細節（Risk 2 L5）
+
+[Stage2Trainer.monitor_audio_quality](../nsvb/task/stage2.py)（每 `audio_quality_monitor_interval` 步=預設 5000）會：
+1. 抽 `audio_quality_monitor_n_samples`（預設 4）個 amateur 樣本
+2. 計算 `Δ_mel = mel_modified - mel_baseline`（modified = 過 M；baseline = 不過 M）
+3. 比較 voiced 段 vs unvoiced 段 Δ 能量分布
+4. 報告 **`unvoiced_concentration = unvoiced_E / (voiced_E + unvoiced_E)`**
+
+**判讀**（risk.md Risk 2 補強 4）：
+| 範圍 | 含義 | 該怎辦 |
+|---|---|---|
+| < 0.55 | M 修飾集中在 voiced 段 — 真技術修正 | 繼續訓 |
+| 0.55–0.65 | marginal | 留意，再觀察 5000 步 |
+| > 0.65 | **Risk 2 警訊** — M 在去殘響/降噪 | 停下檢查；可能要降 `lambda_adv_mel`，或重新確認 binarize 時 dereverb 有開 |
+
+每次抽樣會把 mel spectrogram 對比存成 `.npz` 到 `checkpoints/stage2/audio_monitor/step{N}_sample0.npz`，包含：
+- `mel_gt` — 原 amateur mel
+- `mel_baseline` — z 不過 M 的 decoder 輸出
+- `mel_modified` — z 過 M 的 decoder 輸出
+- `delta_mel` — 兩者差
+- `f0`, `voiced`, `unvoiced_concentration`
+
+可用 matplotlib 視覺化檢查 M 的修飾集中在哪些 frame：
+
+```bash
+python -c "
+import numpy as np, matplotlib.pyplot as plt
+d = np.load('checkpoints/stage2/audio_monitor/step015000_sample0.npz')
+fig, axs = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+axs[0].imshow(d['mel_gt'].T, origin='lower', aspect='auto');     axs[0].set_title('GT mel')
+axs[1].imshow(d['mel_modified'].T, origin='lower', aspect='auto'); axs[1].set_title('M(z) decoded')
+axs[2].imshow(d['delta_mel'].T, origin='lower', aspect='auto', cmap='RdBu'); axs[2].set_title(f'Δ (uv_conc={d[\"unvoiced_concentration\"]:.3f})')
+plt.tight_layout(); plt.savefig('audio_monitor_step15000.png', dpi=100)
+"
+```
+
+> 不想監控可調 `audio_quality_monitor_interval` 設大數值（例如 999999999）讓它實質不跑；但**強烈不建議關**，這是 Risk 2 訓中唯一警報機制。
+
 ### 7.3 ckpt 機制 / 中段續訓（同 Stage 1）
 
 ```bash
@@ -395,7 +464,18 @@ python -m scripts.infer \
 
 > Mode B 輸出長度 = pro ref 長度（**不等於** amateur 長度），需配 pro ref 的伴奏。
 
-### 8.3 跨機器推理（Stage 1 ckpt 路徑不同時）
+### 8.3 推理端 dereverb（Risk 2 推理對齊）
+
+[scripts/infer.py](../scripts/infer.py) 預設對輸入做 dereverb + loudness norm，與訓練 binarize 對齊（避免分布偏移讓 M 看到沒見過的音質域）。
+若 user 提供的是已是乾淨 studio 錄音，加 `--no-dereverb` 跳過：
+
+```bash
+python -m scripts.infer ... --input-a clean_studio.wav --no-dereverb --output result.wav
+```
+
+> **不確定就保持預設**。dereverb 對乾淨輸入近乎 noop（DeepFilterNet3 偵測無 reverb 時改動極小），但對 user 隨手錄的手機音檔關鍵。
+
+### 8.4 跨機器推理（Stage 1 ckpt 路徑不同時）
 
 Stage 2 ckpt 內紀錄了訓練機上的 Stage 1 路徑；遷到別機需顯式覆寫：
 
@@ -425,9 +505,13 @@ python -m scripts.infer \
 Linux 預設 fork 在 CUDA 下不安全。已知症狀：訓練啟動後第一個 batch 後 hang。
 解法：開 trainer 之前加 `mp.set_start_method('spawn', force=True)`，或設 `--num-workers 0` 暫時繞開。
 
-### 9.3 DeepFilterNet 載入失敗
+### 9.3 DeepFilterNet 載入失敗（重要）
 
-第一次跑 binarizer 會自動下載 DeepFilterNet3 model 到 `~/.cache/DeepFilterNet/`；網路不穩會卡。離線機器可預先下載，或用 `--no-dereverb` 關掉（**會違反 Risk 2 主防線**，僅 smoke test 可用）。
+第一次跑 binarizer 會自動下載 DeepFilterNet3 model 到 `~/.cache/DeepFilterNet/`；網路不穩會卡。處理方式：
+
+1. **首選**：在有網路的機器跑一次 `python -c "from df.enhance import init_df; init_df()"`，把 `~/.cache/DeepFilterNet/` 整包拷貝到目標機器的同位置
+2. 設代理：`export HTTPS_PROXY=...`
+3. **不得已**才用 `--no-dereverb` — 會違反 Risk 2 主防線（L2），失去訓練最重要的音質域對齊機制；**會直接讓 M 學成去殘響濾波器**，僅 vocoder identity test / smoke test 可用，production 訓練嚴禁
 
 ### 9.4 Whisper 模型下載慢
 
