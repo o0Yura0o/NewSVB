@@ -161,6 +161,18 @@ class Stage2Config:
     identity_pro_prob: float = 0.2
     lambda_ppg: float = 0.0  # TODO: 實作 fast mel→PPG predictor 後啟用
 
+    # ── D_mel real source（Risk 2 fallback）──
+    # 預設 False：D_mel real 只看 pro mel（rebuild_checklist §C 設計，把 D_mel 從
+    #            「自然度」升級成「pro 自然度」，提供 mel 層 pro-direction 推力）
+    # 設 True 啟用 fallback：D_mel real 改餵 pro+amateur 混合（每 step 兩邊各半），
+    #            退化成 ver1 的「自然度判別器」，犧牲 mel 層 pro-direction 訊號換取
+    #            「絕不鼓勵去殘響」的安全
+    # 何時啟用：訓中 monitor_audio_quality 連續兩次顯示 unvoiced_concentration > 0.65
+    #          時 resume + 啟此 flag（救火，不是預設）。
+    # 前提：Risk 2 L2（dereverb 對兩邊都做）正確執行 → D_mel pro-only 安全。
+    #       若無法保證 dereverb，從一開始就建議啟此 flag
+    dmel_mix_amateur_real: bool = False
+
     # ── Optimizer (TTUR) ──
     lr_m: float = 1e-4
     lr_dz: float = 4e-4
@@ -188,6 +200,14 @@ class Stage2Config:
     stage1_ckpt: str = "checkpoints/stage1/stage1_latest.pt"
     ckpt_dir: str = "checkpoints/stage2"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ── M 漂移健康檢查（Risk: kernel=1 太保守）─────────────
+    # 若訓 N 步後 delta_over_z 仍 < threshold，print 警告建議切 --m-kernel-size 3。
+    # 為什麼 30000 步：L_adv_z 在 5000 步 warmup 結束後正式 active，再給 25000 步
+    # 讓 M 學會基本 mapping；30000 仍 flat 表示 kernel=1 的 pointwise 表達力不夠。
+    # 為什麼 0.03 閾值：經驗值；< 3% 表 M 幾乎沒動 z，pro-style 修飾學不出來
+    delta_health_check_step: int = 30000
+    delta_health_check_threshold: float = 0.03
 
 
 # ── 工具：兩 dataloader cycle ───────────────────────────
@@ -286,6 +306,9 @@ class Stage2Trainer:
         n_dz = sum(p.numel() for p in self.D_z.parameters()) / 1e6
         print(f"[stage2] init done: M={n_m:.2f}M, D_z={n_dz:.2f}M, "
               f"lr(M/Dz/Dmel)={cfg.lr_m:.0e}/{cfg.lr_dz:.0e}/{cfg.lr_dmel:.0e}")
+        print(f"[stage2] D_mel real source: "
+              f"{'pro+amateur (Risk 2 fallback)' if cfg.dmel_mix_amateur_real else 'pro only (default)'}",
+              flush=True)
 
     # ── 共用：把一個 batch 餵 frozen CVAE.encoder 拿 z 與下採條件 ─
     def _encode_and_downsample(self, batch: dict):
@@ -357,13 +380,19 @@ class Stage2Trainer:
         d_z_loss.backward()
         self.opt_dz.step()
 
-        # ── (2) Update D_mel (real = pro mel only) ──
+        # ── (2) Update D_mel (real = pro mel only by default) ──
         d_mel_loss_val = 0.0
         if self.cfg.lambda_adv_mel > 0:
             with torch.no_grad():
                 z_a_mapped_for_mel = self.M(z_a)
                 fake_mel = self._decode_with_mapped_z(z_a_mapped_for_mel, ba)
-            real_ret = self.D_mel(bp["mel"])
+            # Risk 2 fallback：若啟用 dmel_mix_amateur_real，real 餵 pro+amateur 混合；
+            # 用 cat 一次餵進 D_mel 比餵兩次平均更穩（梯度尺度同步）
+            if self.cfg.dmel_mix_amateur_real:
+                real_mel = torch.cat([bp["mel"], ba["mel"]], dim=0)  # [2B, T, NUM_MELS]
+            else:
+                real_mel = bp["mel"]
+            real_ret = self.D_mel(real_mel)
             fake_ret = self.D_mel(fake_mel.detach())
             d_mel_loss = hinge_d_loss(real_ret["y"], fake_ret["y"])
             self.opt_dmel.zero_grad()
@@ -401,6 +430,16 @@ class Stage2Trainer:
             m_loss_dict["l_adv_mel"] = 0.0
 
         # 3d. L_identity_pro（隨機 20% 抽中）
+        # 為什麼 stochastic 不是 bug（設計意圖）：
+        #   - 設計目的：M 偶爾被叫去看 pro 端「不要漂太遠」，但不犧牲 amateur 端訓練
+        #   - 「100% × 0.02」不等價：每步固定觸發改變 gradient direction 性質，
+        #     會把 M 訓成「總是試圖 identity-on-pro」（pro 聲也有些瑕疵應允許微調）
+        # 為什麼動量擾動量級小：
+        #   - lambda × E[l_id_pro] ≈ 0.1 × 0.01·||z|| ≈ 0.001·||z||，比主 loss
+        #     (l_nce/l_adv_z ~0.5–2) 小 1–2 數量級
+        #   - opt_m 用 Adam β1=0.5（GAN 慣例），動量半衰期 ~1 步即輕量
+        # 注意：本配方尚未經過實機驗證；若實際訓練 m_total 出現「每 5 步一個 spike」
+        #      週期性震盪，考慮改為 100% 觸發 + 較小常數權重（例如 0.02）
         if (self.cfg.lambda_identity_pro > 0
                 and torch.rand(1).item() < self.cfg.identity_pro_prob):
             z_p_mapped = self.M(z_p)
@@ -575,6 +614,10 @@ class Stage2Trainer:
         t0 = time.time()
         running = {}
         last_logged_step = self.step
+        # Risk: kernel=1 太保守 — 30k 步後 ‖Δ‖/‖z‖ 仍 < threshold 警告一次
+        # 為什麼用 list of recent values 而非單點：避免單步雜訊導致 false positive
+        delta_recent: list = []
+        delta_warned = False
         while self.step < self.cfg.max_steps:
             metrics = self.train_step()
             self.step += 1
@@ -596,9 +639,30 @@ class Stage2Trainer:
                     "d_z": f"{avg.get('d_z', 0):.3f}",
                     "Δ/z": f"{avg.get('delta_over_z', 0):.3f}",
                 })
+                # 收集 delta_over_z 移動平均樣本，留待 30k 步後做健康檢查
+                delta_recent.append(avg.get("delta_over_z", 0.0))
+                if len(delta_recent) > 20:
+                    delta_recent.pop(0)
                 running = {}
                 last_logged_step = self.step
                 t0 = time.time()
+
+            # Risk: kernel=1 太保守警告（一次性，避免 spam log）
+            if (not delta_warned
+                    and self.step >= self.cfg.delta_health_check_step
+                    and len(delta_recent) >= 10
+                    and self.cfg.m_kernel_size == 1):
+                delta_ma = sum(delta_recent) / len(delta_recent)
+                if delta_ma < self.cfg.delta_health_check_threshold:
+                    pbar.write(
+                        f"[stage2] ⚠️  ‖Δ‖/‖z‖ moving avg = {delta_ma:.4f} "
+                        f"< threshold {self.cfg.delta_health_check_threshold} "
+                        f"after {self.step} steps with kernel_size=1.\n"
+                        f"           M 可能太保守，無法生成顫音/滑音等時間軸動態。\n"
+                        f"           建議：以 --m-kernel-size 3 重新訓練 "
+                        f"(可從 stage1 ckpt 或當前 stage2 ckpt 接續)。"
+                    )
+                    delta_warned = True
 
             if self.step % self.cfg.save_interval == 0:
                 self.save_ckpt(tag=f"step{self.step}")
@@ -632,6 +696,10 @@ def main():
                         required=True)
     parser.add_argument("--ckpt-dir", default="checkpoints/stage2")
     parser.add_argument("--m-kernel-size", type=int, default=1, choices=[1, 3])
+    parser.add_argument("--dmel-mix-amateur-real", action="store_true",
+                        help="Risk 2 fallback：D_mel real 改餵 pro+amateur 混合（預設只看 pro）。"
+                             "訓中 monitor 顯示 unvoiced_concentration > 0.65 連續兩次時 resume + 啟此 flag 救火；"
+                             "犧牲 mel 層 pro-direction 訊號換取「絕不鼓勵去殘響」的安全")
     parser.add_argument("--resume", default="",
                         help="從現有 Stage 2 ckpt 路徑恢復（M/D_z/D_mel + 三 optimizer + step）。"
                              "可用 'latest' 簡寫，自動找 {ckpt-dir}/stage2_latest.pt")
@@ -651,6 +719,7 @@ def main():
         stage1_ckpt=args.stage1_ckpt,
         ckpt_dir=args.ckpt_dir,
         m_kernel_size=args.m_kernel_size,
+        dmel_mix_amateur_real=args.dmel_mix_amateur_real,
     )
     trainer = Stage2Trainer(cfg)
 

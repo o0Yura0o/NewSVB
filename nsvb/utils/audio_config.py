@@ -92,11 +92,17 @@ FRAME_RATE_HZ = SAMPLE_RATE / HOP_SIZE   # 86.13 fps
 FRAME_DURATION_MS = 1000.0 / FRAME_RATE_HZ  # ~11.6 ms
 
 # ── F0 抽取（torchcrepe）──────────────────────────────────
-# 為什麼 fmin=50, fmax=1100：人聲 F0 範圍
+# 為什麼 fmin=50, fmax=1400：人聲 F0 範圍
 #   - 男低音底 ~ 65 Hz (C2)，留 50 為下限緩衝
-#   - 女高音哨音 ~ 1000 Hz，1100 為上限緩衝（覆蓋花腔技巧）
+#   - 流行女歌手 belt 高潮段常觸碰 C6 (1047 Hz) ~ E6 (1319 Hz)；
+#     fmax=1400 覆蓋到 F6 (1397 Hz)，遠超流行歌 tessitura 上限
+#   - **為什麼不更高**（如 1800/2000）：CREPE bin 範圍越大、false positive 越多；
+#     1400 是「能容納所有現實高音 + 不引入過多噪聲」的甜蜜點
+#   - **過往陷阱**：先前設 1100 會在 D6 (1175 Hz) 處被 CREPE 截到 octave 錯誤
+#     （D5=587），給 D_z 一個「胸聲 register 條件」對「實際頭聲 mel」的錯誤對齊
+#     訊號——比直接 unvoiced 還糟糕
 F0_FMIN = 50.0
-F0_FMAX = 1100.0
+F0_FMAX = 1400.0
 # 為什麼用 'full' model：~80MB，比 'tiny' 慢但對歌聲（vibrato、glide）準確度
 #                      明顯較好；Phase 0 一次性抽取，速度不重要
 CREPE_MODEL = "full"

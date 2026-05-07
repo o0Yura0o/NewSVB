@@ -199,6 +199,10 @@ python -m scripts.audio_quality_probe \
 
 ### 5.3 Binarize 兩個 dataset（Risk 2 L1 + L2 — dereverb + 響度正規化）
 
+> **⚠️ 重要**：若 [audio_config.py](../nsvb/utils/audio_config.py) 的 `F0_FMIN` / `F0_FMAX` / `HOP_SIZE` / `SAMPLE_RATE` 等 **任一改過**，已存在的 `data/binarized/` 必須**全部重 binarize**（這些常數會 freeze 進 .npz 的特徵值，舊檔不會自動更新）。
+> 重 binarize 流程：刪 `data/binarized/{dataset}/` 重跑下面命令。
+
+
 ```bash
 # Pro side：M4Singer（注意：不加 --no-dereverb，要對兩邊都做 dereverb）
 python -m nsvb.data.binarizer \
@@ -414,6 +418,37 @@ plt.tight_layout(); plt.savefig('audio_monitor_step15000.png', dpi=100)
 ```
 
 > 不想監控可調 `audio_quality_monitor_interval` 設大數值（例如 999999999）讓它實質不跑；但**強烈不建議關**，這是 Risk 2 訓中唯一警報機制。
+
+### 7.2.2 訓中自動健康檢查
+
+[Stage2Trainer.fit](../nsvb/task/stage2.py) 還有兩個自動 fallback 警告（不會中斷訓練，只 print 提示）：
+
+**A. M kernel_size=1 太保守警告**
+- 觸發條件：step ≥ `delta_health_check_step`（預設 30000）後，`‖Δ‖/‖z‖` 移動平均仍 < `delta_health_check_threshold`（預設 0.03）
+- 一次性訊息：「M 可能太保守，無法生成顫音/滑音等時間軸動態。建議：以 `--m-kernel-size 3` 重新訓練」
+- 處理：停下來看是否認同，認同就 resume + `--m-kernel-size 3` 重訓（**注意**：M 結構改了，舊 ckpt 的 M weight 不能直接 load；要從 stage1 ckpt 重啟 stage2）
+
+**B. PatchNCE T_z 過小警告**
+- 觸發條件：`T_z < 4`（通常表示 `--max-frames` 設太小，或 batch 內全是極短 sample）
+- 一次性 RuntimeWarning：建議 `max_frames ≥ 64`
+
+### 7.2.3 Risk 2 救火選項（D_mel fallback）
+
+若 [§7.2.1](#721-訓中音質監控細節risk-2-l5) 的 `unvoiced_concentration` 持續 > 0.65（連兩次採樣），代表 M 在學去殘響。處理：
+
+```bash
+# 停下來，加 --dmel-mix-amateur-real 重 resume：
+python -m nsvb.task.stage2 \
+    --binarized-root data/binarized \
+    --stage1-ckpt checkpoints/stage1/stage1_latest.pt \
+    --resume latest \
+    --dmel-mix-amateur-real \
+    --ckpt-dir checkpoints/stage2
+```
+
+`--dmel-mix-amateur-real` 把 D_mel real 改餵 pro+amateur 混合，犧牲 mel 層 pro-direction 訊號換取「絕不鼓勵去殘響」的安全。
+
+> **建議**：先確認 binarize 是否正確開了 dereverb（[§5.3](#53-binarize-兩個-datasetrisk-2-l1--l2--dereverb--響度正規化)），如果 dereverb 沒做好，啟此 flag 也救不了根本問題。
 
 ### 7.3 ckpt 機制 / 中段續訓（同 Stage 1）
 

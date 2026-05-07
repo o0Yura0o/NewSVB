@@ -105,8 +105,25 @@ class PatchNCELoss(nn.Module):
             mask: [B, T] (1=valid, 0=pad) or None
         Returns:
             idx: [B, N]
+
+        為什麼用 torch.randint 而非 random.sample：
+            randint 是 with replacement，不會 OOB；min(num_patches, T) 已 clamp。
+            random.sample 是 without replacement，T < num_patches 時會 raise。
+
+        T 太小時的訊號退化：
+            T < 4 時 contrastive 幾乎沒 negative pair（每個 query 最多看到 3 個 key），
+            訊號太弱對 gradient 沒貢獻。發出警告（不 raise）讓 caller 知道該調
+            max_frames 或 batch_size。
         """
         N = min(self.num_patches, T)
+        if T < 4 and not getattr(self, "_warned_small_T", False):
+            import warnings
+            warnings.warn(
+                f"PatchNCE: T_z={T} < 4，contrastive 訊號將極弱。"
+                f"建議將 max_frames 提升至 ≥ 64（latent down=4 → T_z ≥ 16）",
+                RuntimeWarning,
+            )
+            self._warned_small_T = True
         if mask is None:
             return torch.randint(0, T, (B, N), device=device)
         # 為什麼 valid frames 不夠就 fallback 到 random：

@@ -135,3 +135,74 @@
 - **Phase 3 主力**：模式 A（所有使用者的預設體驗）
 - **Phase 3 次要**：模式 B（搬原論文 EHSADTW + `torch.gather` 邏輯約 80 行；
                               純推理路徑，不影響訓練）
+
+---
+
+# Potential risks of Implemented code
+
+> **狀態圖例**：
+> - ✅ 已修正（程式碼有對應改動）
+> - ⚠️ 部分緩解（加 fallback / 警告，非預設改動）
+> - ℹ️ 評估後不需改（風險評估誤判或現有架構已防）
+
+---
+
+### 一、 核心架構的物理衝突（高風險）
+
+#### 1. M 網路 kernel_size=1 無法生成時間軸動態 — ⚠️ 部分緩解
+- **原描述**：kernel_size=1 是 pointwise MLP，無時間感受野；amateur z 若為 flat，無法生成顫音/滑音
+- **判讀**：技術上正確，但漏算了一個事實——顫音/滑音的時間動態本來就在 z_a 裡（encoder 從 mel_a 拿到，下採 4× 後 ~43 fps，仍能解析 5–7 Hz 顫音的 ~8 frame/cycle）。M 不需要「無中生有」，只需「修飾既有 z 朝 pro 分布」
+- **唯一真實風險**：當 amateur 完全沒唱顫音 → z 為 flat → kernel=1 的 pointwise M 確實無法獨力長出顫音；decoder 雖能展現顫音模式，但需要 M 先把 z 移到「正確的 pro subspace 標籤」
+- **已實作緩解**：
+  - [Stage2Trainer.fit](nsvb/task/stage2.py) 在 step ≥ `delta_health_check_step` (30000) 後若 `‖Δ‖/‖z‖` 移動平均 < `delta_health_check_threshold` (0.03) 自動 print 警告，建議切 `--m-kernel-size 3` 重訓
+  - 兩個閾值都暴露在 [Stage2Config](nsvb/task/stage2.py)，可調
+- **保守選擇**：直接用 `--m-kernel-size 3`，warp-invariance 在 3-frame context (~70 ms) 下只是輕微違反，遠小於音素時長
+
+#### 2. PPG 強制 Resample 50 → 172 fps 子音邊界模糊 — ℹ️ 評估後不需改
+- **原描述**：50 fps 線性插值放大 3.45× 到 172.27 fps，子音 (~20 ms) 邊界被塗抹
+- **判讀錯誤點**：Whisper hidden state 不是 one-hot phoneme，是已被 attention 平滑過的高維連續表徵；20ms 子音早已被 Whisper 內部攤平到周圍幾個 50fps frame 中。在已平滑的連續向量空間做線性 interp 幾乎等於 ground truth
+- **架構保護層已存在**：
+  - D_z 條件用 [phoneme_id](nsvb/data/cluster_ppg.py)（k-means argmax discrete，**不**經 interp）
+  - Continuous PPG 只進 decoder（WN kernel=5 大感受野，吸收 interp 平滑）
+  - Nearest 反而會引入 step-function 跳變對下游梯度更不友善
+- **行動**：不改程式碼。若 Phase 2 試聽**確認**有咬字模糊，再做 ablation（`mode="nearest"` + 1D smoothing conv）
+
+---
+
+### 二、 訓練動態與 Loss 設計（中風險）
+
+#### 1. 隨機觸發的 L_id_pro 摧毀優化器動量 — ℹ️ 評估後不需改
+- **原描述**：每 5 步丟進一次量級不同的 L_id_pro 打亂 Adam 動量
+- **判讀**：理論方向對但量級錯：
+  - `lambda × E[l_id_pro] ≈ 0.1 × 0.01·||z|| ≈ 0.001·||z||`，比主 loss (l_nce/l_adv_z ~0.5–2) 小 1–2 數量級
+  - opt_m 用 Adam β1=0.5（GAN 慣例），動量半衰期 ~1 步即輕量 — β1=0.9 才是用戶原描述適用的「重動量」場景
+- **設計意圖**：「100% × 0.02」不等價，固定觸發會把 M 訓成「總是試圖 identity-on-pro」（pro 聲也有些瑕疵應允許微調）
+- **狀態**：尚未經實機驗證（NSVB-ZH ver1 配方繼承自另一 AI 草稿，未跑過實際訓練）
+- **已實作緩解**：[Stage2Trainer.train_step](nsvb/task/stage2.py) `# 3d. L_identity_pro` 區塊加說明 comment + 失敗時的 fallback 提示（改 100% × 0.02）
+- **觀察條件**：訓中若 m_total 出現「每 5 步一個 spike」週期性震盪 → 改為固定權重
+
+#### 2. D_mel 領域偏移（Stage 2 real = pro only）→ 災難性遺忘 → 鼓勵去殘響 — ⚠️ 部分緩解
+- **原描述**：Stage 2 D_mel 只看 pro，會把「乾淨錄音室聲」當唯一 real → M 被次級壓力推向去殘響
+- **判讀**：擔憂的 mechanism 真實存在，但用戶提的 mitigation（ConcatDataset 混合 real）會破壞 [rebuild_checklist §C](rebuild_checklist.md) 設計（D_mel 升級為 pro-direction 推力）
+- **架構主防線已存在**：
+  - **Risk 2 L2** dereverb 對兩 dataset 都做 → D_mel 沒有「殘響=amateur 簽名」捷徑
+  - λ_adv_mel = 0.2 << λ_adv_z = 1.0：D_mel 是輔助
+  - L_PatchNCE 鎖 z-frame 對應，過激去殘響會被懲罰
+  - **Risk 2 L5** monitor (unvoiced_concentration) 直接抓此 failure
+- **已實作緩解**：[Stage2Config.dmel_mix_amateur_real](nsvb/task/stage2.py) + CLI `--dmel-mix-amateur-real`（預設 off）；訓中 monitor 顯示 `unvoiced_concentration > 0.65` 連續兩次時 resume 啟用作 fallback 救火
+
+---
+
+### 三、 邊界條件與小細節
+
+#### PatchNCE 取樣越界崩潰 — ℹ️ 描述錯誤，現有程式碼已防
+- **原描述**：T_z=86 但 num_patches=128，`random.sample` 會 crash
+- **判讀**：[losses.py PatchNCELoss._sample_indices](nsvb/model/losses.py) 早就有 `N = min(self.num_patches, T)` clamp，且用 `torch.randint`（with replacement）非 `random.sample`。永遠不會 OOB
+- **唯一真風險**：T < 4 時 contrastive 訊號極弱（每 query 至多看到 3 個 negative）
+- **已實作緩解**：T < 4 時 PatchNCE 發 RuntimeWarning（一次性，不 raise），建議調大 max_frames
+
+#### 高音女歌手 F0 截斷 — ✅ 已修正
+- **原描述**：fmax=1100 Hz 截掉 D6 (1175 Hz) 等流行女聲高音
+- **判讀**：完全正確；CREPE 在 F0 > fmax 時通常給 octave 錯誤（D6→D5），給 D_z 一個錯誤 register 條件，比直接 unvoiced 還糟
+- **已修正**：[audio_config.F0_FMAX](nsvb/utils/audio_config.py) 1100 → **1400** Hz（覆蓋到 F6=1397 Hz）
+- **重要：改完要重 binarize**（已 binarized 的 .npz 是用舊 fmax 抽的不會自動更新）
