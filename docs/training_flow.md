@@ -141,7 +141,7 @@ LATENT_FRAME_RATE_HZ = 172.27 / 4  = 43.07 fps  (z, latent)
 
 > **三個 gate 都要 PASS** 才能進 Phase 1。順序建議：先 ①（vocoder 不過後續都白做），再 ②（音質基線），最後 ③（資料策展）。
 
-#### Gate ①：Vocoder identity test
+#### Gate ①：Vocoder identity test（建議跑兩次）
 
 **腳本**：`scripts/vocoder_identity_test.py`。
 
@@ -152,8 +152,15 @@ LATENT_FRAME_RATE_HZ = 172.27 / 4  = 43.07 fps  (z, latent)
 
 **為什麼必要**：vocoder 是凍結 ckpt；若它對中文歌聲重建已經斷裂（mel→wav 失真），後續 M 任何改進都看不到。
 
-**目前實測**（origin GT 22050 native，pyworld + interp）：
+**跑兩次**：
+- **A. Raw wav**（無 `--apply-loudness-norm`）：vocoder ckpt 訓練分布的對照
+- **B. Loud-normed**（加 `--apply-loudness-norm`）：NSVB-ZH binarize 端實際 mel 分布的兼容性 gate
+
+> NSVB 原版 vocoder 訓練時 `loud_norm: false`，但 NSVB-ZH binarize 為 Risk 2（響度對齊）預設啟用 BS.1770 -22 LUFS；兩跑都要 PASS 才能保證訓練 / 推理 mel 與 vocoder 兼容。
+
+**目前實測**（A. raw wav，pyworld + interp）：
 - SSIM = 0.94, F0 RMSE = 5.8 Hz → **PASS** ✅
+- B（loud-normed）：尚未跑 — 部署到 Linux GPU 機器後第一件事
 
 #### Gate ②：Audio quality probe（Risk 2 L4）
 

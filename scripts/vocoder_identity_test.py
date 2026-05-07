@@ -61,6 +61,7 @@ import torch
 from nsvb.utils.audio_config import SAMPLE_RATE
 from nsvb.utils.audio_io import (
     load_wav,
+    loudness_normalize,
     compute_mel,
     pad_wav_to_mel_length,
 )
@@ -283,21 +284,31 @@ def test_one(
     save_dir: Optional[Path] = None,
     f0_method: str = "torchcrepe",
     f0_interp: bool = False,
+    apply_loudness_norm: bool = False,
 ) -> dict:
     """
     對單一 wav 跑：
-        load → mel_gt + F0_gt → vocoder(mel, F0) → wav_recon → mel_recon
+        load → (optional loud_norm) → mel_gt + F0_gt → vocoder(mel, F0) → wav_recon → mel_recon
     回傳 metric dict；若 save_dir 給了，把 GT 與 recon wav 都存下供人耳聽測。
 
     為什麼 vocoder 還要 F0：
       NSVB 1012 ckpt config 標 `use_pitch_embed: true`，generator 把 F0 做為
       pitch embedding 條件；少餵 F0 會 missing arg 或輸出畸變。
+
+    Args:
+        apply_loudness_norm:
+            預設 False：用 raw wav 算 mel（與 vocoder 1012 ckpt 訓練時 loud_norm=false 對齊）
+            設 True：先 BS.1770 -22 LUFS 再算 mel，**模擬 NSVB-ZH binarize 階段的實際 mel
+                    分布**，驗證 vocoder 對 loud-normed mel 是否仍能高品質重建。
+                    這是 NSVB-ZH 蓄意對 NSVB 反向決策（Risk 2 響度對齊）的兼容性 gate
     """
     # 1. Load + (optional) loudness norm + GT mel
     # 為什麼預設不做 loudness：NSVB 訓練 vocoder 時沒有 loudness norm，
-    # 加了會讓 mel 分布偏離 vocoder 期望（影響 vocoder identity test 結果）
+    # 加了會讓 mel 分布偏離 vocoder 訓練期望；但啟用此旗標可驗證 NSVB-ZH binarize 端
+    # 的 loud-normed mel 是否仍與 vocoder 兼容
     wav_gt = load_wav(str(wav_path))
-    # NOTE: loudness_normalize() 移到 binarize 階段，vocoder identity test 直接用 raw wav
+    if apply_loudness_norm:
+        wav_gt = loudness_normalize(wav_gt)
     mel_gt = compute_mel(wav_gt)
     wav_gt = pad_wav_to_mel_length(wav_gt, mel_gt)
 
@@ -433,6 +444,14 @@ def main():
              "對齊 NSVB norm_interp_f0 + denorm_f0(use_uv=False) 行為。"
              "若 voiced↔0 硬跳是電音元兇，這條會解決",
     )
+    parser.add_argument(
+        "--apply-loudness-norm", action="store_true",
+        help="算 mel 前先對 GT wav 做 BS.1770 -22 LUFS 響度正規化，"
+             "**模擬 NSVB-ZH binarize 階段的實際 mel 分布**，驗證 vocoder 對 "
+             "loud-normed mel 是否仍能高品質重建（≥ 0.90 SSIM）。"
+             "NSVB 原版訓練 vocoder 時 loud_norm=false，所以這是蓄意對 NSVB 反向決策"
+             "（為 Risk 2 響度對齊）的兼容性 gate",
+    )
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -467,7 +486,8 @@ def main():
         for i, wav_path in enumerate(wavs):
             result = test_one(wav_path, vocoder=vocoder, device=device,
                               save_dir=save_dir, f0_method=args.f0_method,
-                              f0_interp=args.f0_interp)
+                              f0_interp=args.f0_interp,
+                              apply_loudness_norm=args.apply_loudness_norm)
             per_file.append(result)
             print(f"  [{i+1}/{len(wavs)}] {wav_path.name}: "
                   f"SSIM={result['mel_ssim']:.3f}  "
@@ -493,10 +513,19 @@ def main():
               f"F0_RMSE={rmse_arr.mean():.2f}±{rmse_arr.std():.2f} Hz")
 
     # 寫 report
+    # 為什麼把 args 一起存：開啟 --apply-loudness-norm 與否會給出不同的 SSIM/F0 RMSE，
+    #                  將來對比結果時必須能分辨此次跑的設定
     report_path = out_dir / "report.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump({
             "vocoder_ckpt": args.vocoder_ckpt,
+            "args": {
+                "f0_method": args.f0_method,
+                "f0_interp": args.f0_interp,
+                "apply_loudness_norm": args.apply_loudness_norm,
+                "n_per_dir": args.n_per_dir,
+                "seed": args.seed,
+            },
             "thresholds": {
                 "ssim_pass": SSIM_PASS,
                 "ssim_marginal": SSIM_MARGINAL,

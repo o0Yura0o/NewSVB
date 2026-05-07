@@ -160,7 +160,9 @@ NSVB-ZH 最大的訓練風險是 **Risk 2 — 音質域與技術域混淆**：M4
 
 ### 5.1 Vocoder identity test（dealbreaker）
 
-驗證 NSVB 原作者的 HifiGAN 能不能重建中文歌聲 mel：
+驗證 NSVB 原作者的 HifiGAN 能不能重建中文歌聲 mel。**建議跑兩次**（兩種設定都要 PASS）：
+
+**A. Raw wav baseline**（vocoder ckpt 訓練分布，loud_norm=false）：
 
 ```bash
 python -m scripts.vocoder_identity_test \
@@ -168,12 +170,28 @@ python -m scripts.vocoder_identity_test \
     --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
     --n-per-dir 20 \
     --save-wavs \
-    --out-dir outputs/phase0_vocoder
+    --out-dir outputs/phase0_vocoder_raw
 ```
 
-**通過條件**：兩個資料集的 verdict 都是 PASS（mel SSIM ≥ 0.90 且 F0 RMSE ≤ 10 Hz）。
+**B. Loud-normed**（驗證 NSVB-ZH binarize 端的實際 mel 分布與 vocoder 兼容）：
 
-> 不過則 vocoder 要在中文歌聲上 fine-tune（不在本指南範圍）；不過不能跳過——後續 M 的所有改進都會被 vocoder 重建誤差掩蓋。
+```bash
+python -m scripts.vocoder_identity_test \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
+    --n-per-dir 20 \
+    --save-wavs \
+    --apply-loudness-norm \
+    --out-dir outputs/phase0_vocoder_loudnormed
+```
+
+**通過條件**：**兩次跑**的兩個資料集 verdict 都是 PASS（mel SSIM ≥ 0.90 且 F0 RMSE ≤ 10 Hz）。
+
+> **為什麼跑兩次**：NSVB 原版訓練 vocoder 時 `loud_norm: false`，但 NSVB-ZH binarize 為了 Risk 2（amateur/pro 響度對齊）預設啟用 BS.1770 -22 LUFS。這形成 vocoder 訓練分布 vs 我們實際餵的 mel 分布的潛在不匹配，必須跑 B 確認 vocoder 對 loud-normed mel 仍能 PASS。
+>
+> A 不過：vocoder 對中文歌聲本身就不行 → fine-tune vocoder 於中文歌聲後再進 Stage 1。
+> A 過、B 不過：loud_norm 把 mel 推離 vocoder 訓練分布 → 拿掉 binarize 端 loud_norm（用其他方式緩解 Risk 2 響度差）或 fine-tune vocoder 於 loud-normed mel。
+> 兩者皆過：放心進 Phase 1。
 
 ### 5.2 Audio quality probe（Risk 2 L4 — 兩 dataset 音質統計差距）
 
