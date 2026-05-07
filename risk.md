@@ -68,6 +68,21 @@
 - **原描述**：純無條件 D_z 下，M 可能把所有業餘樣本套上「最高分的 pro 技術指紋」（例如把低音也加頭腔共鳴）
 - **消除方式**：D_z 的 register bucket 條件強制聲區對齊——低音區必須展現胸聲特徵、高音區必須展現頭聲特徵
 
+### Risk 9：Amateur dataset 含「near-pro」雜訊樣本（已消除）
+- **原描述**：VocalVerse 929 筆中含「near-pro」樣本（pro 4-dim 評分接近 pro 水準）。若全收當 amateur side：
+  - D_z 看 amateur batch 內混有 z 分布近 pro 的樣本 → 矛盾訊號 → 梯度方向不穩
+  - PatchNCE / L_id_pro 對 high-score amateur 樣本平均效應 → M 「需要修飾」的訓練壓力降低 → ‖Δ‖/‖z‖ 偏低、修飾不足
+  - 推理時 user 拿真正差的業餘輸入，M 訓練分布偏中等 → 修不到位
+- **消除方式**：[`nsvb/data/vocalverse_mos.py`](nsvb/data/vocalverse_mos.py) + binarizer `--vocalverse-amateur-score-max 3.0`
+  - 利用 [VocalVerse 作者論文 arXiv:2512.06999](https://arxiv.org/abs/2512.06999) 提供的 **pro 4-dim 標記**（音色/情感/技巧/氣息控制）
+  - 主推 `amateur_score = (技巧 + 氣息控制) / 2 ≤ 3.0`：
+    - 只取與 vocal mechanics 相關的兩個維度（M 訓練的目標）
+    - **不**用音色（physiological 特性，由 spk_emb 鎖；論文 §3.1.5 與 Sundberg 1974 文獻）
+    - **不**單純依賴 amateur MOS（與 pro 標記只 0.38 spearman 相關，可作次要 corroborator）
+  - 結果：留 536/929 筆 (~29.8 h)，與 M4Singer pro side (~30 h) 對齊
+  - 33 個 singer 全保留，per-singer 中位 17 樣本（min ~12），speaker diversity 不受損
+  - kept amateur_score 範圍 [1.0, 3.0]，mean 2.40，明確「技術偏弱」區間
+
 ## 持續監控項
 
 ### Monitor 1：資料策展 JSD 指標

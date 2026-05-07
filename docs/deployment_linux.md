@@ -228,14 +228,55 @@ python -m nsvb.data.binarizer \
     --data-root data \
     --out-root data/binarized
 
-# Amateur side：VocalVerse
+# Amateur side：VocalVerse（推薦加多維過濾留「真業餘」）
 python -m nsvb.data.binarizer \
     --dataset vocalverse \
     --data-root data \
-    --out-root data/binarized
+    --out-root data/binarized \
+    --vocalverse-amateur-score-max 3.0
 ```
 
-每首歌會產出一個 `data/binarized/{dataset}/{item_id}.npz`。**會跑很久**（~3-5 秒/歌 × 8000 首 ≈ 8–14 小時）。可以中斷，重跑會自動 skip 已存在的。
+#### VocalVerse 多維過濾 ⭐ 推薦
+
+VocalVerse 自帶 **兩份** 標記（[作者論文 arXiv:2512.06999](https://arxiv.org/abs/2512.06999)）：
+- `Amateur_overall_mos_avg5.xlsx`：5 位業餘評審平均 1-5 分
+- `Professional_multidim_..._.xlsx`：1 位 pro 教練/筆，4 個維度（音色/情感/技巧/氣息控制）1-5 分
+
+929 筆中含「near-pro 業餘」（pro 評分 4-5 接近 pro 水準）；若直接全用，D_z 會看到 z 分布近 pro 的矛盾訊號 → M 修飾訊號變弱。
+
+##### 推薦過濾分數：`amateur_score = (技巧 + 氣息控制) / 2`
+
+只取 pro 4-dim 中跟 vocal mechanics 相關的兩個維度（技巧 + 氣息），**不**用音色（屬 physiological，由 spk_emb 鎖）也**不**用情感（M 不直接訓練）。amateur MOS 與 pro 標記僅 0.38 spearman 相關，做次要 corroborator。
+
+| `amateur_score ≤ X` | 筆數 | per-singer 中位 | 總時長 | 與 M4Singer 30h 對比 |
+|---:|---:|---:|---:|---|
+| 2.0 | 202 | 6 | 11.1 h | 太少，過擬合 |
+| 2.5 | 371 | 11 | 20.6 h | 強過濾 |
+| **3.0** | **536** | **17** | **29.8 h** | ⭐ **與 pro 對齊** |
+| 3.5 | 676 | 21 | 37.8 h | 含 average，不夠 amateur |
+| 不加 flag | 929 | 28 | ~54 h | 含 high-pro 雜訊 |
+
+##### 多維組合（進階）
+
+| 指令 | 結果 |
+|---|---|
+| `--vocalverse-amateur-score-max 3.0` | 主推 536 / 29.8 h |
+| `--vocalverse-amateur-score-max 3.0 --vocalverse-mos-max 3.5` | 440 / 24.6 h（去掉 pro 看差但群眾覺得好聽的雜訊） |
+| `--vocalverse-amateur-score-max 2.5` | 371 / 20.6 h（強過濾） |
+
+**Sanity check** 標籤分布（不會跑 binarize）：
+
+```bash
+python -m nsvb.data.vocalverse_mos --vocalverse-root data/VocalVerse
+```
+
+> 過濾**只影響 binarize 輸出量**——Phase 1/2 訓練程式碼完全不變；max_steps / loss 配方都保留。
+> 過濾後 binarize 約少 43% 樣本 → 時間從 ~1.5 h 降到 ~0.85 h。
+> `--vocalverse-mos-threshold` 為舊 flag、deprecated 但仍相容（建議改用 `--vocalverse-amateur-score-max`）。
+
+#### Binarize 執行說明
+
+每首歌會產出一個 `data/binarized/{dataset}/{item_id}.npz`。**會跑很久**（M4Singer ~21K 5-sec snippets ≈ 6h；VocalVerse 929 long recordings 過濾後 516 筆 ≈ 0.8h）。可以中斷，重跑會自動 skip 已存在的。
 
 > **不要加 `--no-dereverb`**——這會違反 Risk 2 主防線。`--no-dereverb` 只在 vocoder identity test、smoke test、或刻意做「無 dereverb」對照實驗時才用。
 

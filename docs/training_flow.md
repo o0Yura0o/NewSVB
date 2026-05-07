@@ -58,16 +58,91 @@
 ### 1.1 輸入
 
 ```
-data/m4singer/{歌手#歌名}/{idx}.wav        # 業餘? 不，職業（M4Singer 是錄音室專業歌手）
-data/VocalVerse/{user_id}/{wav_id}.wav     # 業餘
+data/m4singer/{歌手#歌名}/{idx}.wav                                    # 業餘? 不，職業
+data/VocalVerse/{user_id}/{wav_id}.wav                                 # 業餘
+data/VocalVerse/VocalVerse_Datasets-human_labels/Amateur_overall_mos_avg5.xlsx
+                                                                        # 5 位評審 1-5 分平均 MOS
 ```
 
-| 資料集 | 檔案格式 | sample rate | mono/stereo | 角色 |
-|---|---|---:|---|---|
-| M4Singer | wav int16 | 48000 | mono | **professional (z_p)** |
-| VocalVerse | wav int16 | 44100 | stereo | **amateur (z_a)** |
+| 資料集 | 檔案數 | mean duration | 總時長 | sample rate | 角色 |
+|---|---:|---:|---:|---:|---|
+| M4Singer | ~21 K（5-sec snippets） | 5.1 s | ~30 h | 48000 | **professional (z_p)** |
+| VocalVerse | 929 full-length recordings | 209 s | ~54 h | 44100 | **amateur (z_a)** |
 
 > ⚠ 載入時 `librosa.load(sr=22050, mono=True)` 自動 resample + stereo→mono averaging。
+
+#### 1.1.1 VocalVerse 多維過濾（推薦）⭐
+
+VocalVerse 929 筆中含「near-pro 業餘」樣本（pro 4-dim 評分接近 pro 水準）；若直接全用，
+D_z 會在 amateur batch 內看到「z 分布近 pro」的矛盾訊號 → 梯度方向不穩、M 修飾不足。
+
+VocalVerse 同時提供兩份標記（[作者論文 arXiv:2512.06999](https://arxiv.org/abs/2512.06999) §3.1）：
+
+| xlsx | 標記者 | 內容 | 對 NSVB-ZH 的價值 |
+|---|---|---|---|
+| `Amateur_overall_mos_avg5.xlsx` | 5 位業餘評審/筆 | 整體好聽度 1-5 平均 | 次要 corroborator（與 pro 標記只 0.38 spearman 相關） |
+| `Professional_multidim_..._.xlsx` | 1 位 pro 教練/筆 | 4 個維度 1-5：音色/情感/技巧/氣息控制 | **主要 signal**（M 訓練的維度都在裡面） |
+
+##### 主推薦過濾分數：`amateur_score = (技巧 + 氣息控制) / 2`
+
+四個 pro 維度對 NSVB-ZH 各自的關聯性：
+
+| 維度 | 在 NSVB-ZH 的角色 | 用作過濾？ |
+|---|---|---|
+| **技巧** (Vocal Technique) | M 直接訓練的目標（vibrato/portamento/phrasing）。論文 §3.1.5 標「improvable through training」 | ✅ 主要 |
+| **氣息控制** (Breath Control) | M 訓練的目標（與技巧 0.69 spearman 強相關） | ✅ 主要 |
+| **音色** (Timbre Quality) | 由 spk_emb 鎖定（Risk 4 防護），論文 §3.1.5 標「largely related to physiological characteristics」**不可改也不該改** | ❌ 不要過濾 |
+| **情感** (Emotional Expression) | M 不直接訓練，間接由 breath/dynamics 帶出 | △ 次要 |
+
+##### 閾值對應筆數 / 時長（909 筆有完整 pro 標記）
+
+| `amateur_score ≤ X` | 筆數 | singers | 總時長 | per-singer 中位 | 評估 |
+|---:|---:|---:|---:|---:|---|
+| 2.0 | 202 | 32/33 | 11.1 h | 6 | 太少，過擬合 |
+| 2.5 | 371 | 33/33 | 20.6 h | 11 | 強過濾，可用 |
+| **3.0** | **536** | **33/33** | **29.8 h** | **17** | ⭐ **預設**（與 M4Singer 30h 對齊） |
+| 3.5 | 676 | 33/33 | 37.8 h | 21 | 含 average，不夠 amateur |
+
+> 929 筆中 20 筆 pro 標記不全（NaN），過濾時統一 `drop`（保守處理）。
+> 33 singer 全保留，per-singer 中位 17 樣本（min ~12），spk_emb 訓練不過擬合。
+> kept amateur_score 範圍 [1.0, 3.0]，mean 2.40，明確「技術偏弱」區間。
+
+##### 多維 AND 組合（可選）
+
+若想加嚴可同時設多個 max（全部 AND）：
+
+| 指令 | 結果 |
+|---|---|
+| `--vocalverse-amateur-score-max 3.0` | 536 / 29.8 h（**主推**） |
+| `--vocalverse-amateur-score-max 3.0 --vocalverse-mos-max 3.5` | 440 / 24.6 h（去掉「pro 看差但群眾覺得好聽」雜訊） |
+| `--vocalverse-amateur-score-max 2.5` | 371 / 20.6 h（強過濾） |
+| `--vocalverse-technique-max 2.5 --vocalverse-breath-max 3.0` | 個別維度單獨 cap |
+
+`--vocalverse-timbre-max` flag 雖存在但**不建議用**（音色屬 physiological 特性、由 spk_emb 鎖；過濾音色等於拒絕「音色不夠 pop」的業餘者）。
+
+##### 過濾對訓練架構的影響（量化）
+
+| 項目 | 全 929 筆 | amateur_score≤3.0 (536 筆) | 影響 |
+|---|---|---|---|
+| Phase 0 binarize 時間 | ~1.5 h | ~0.85 h | -43% |
+| Phase 1 dataloader chunk 數 | ~28K（pro 21K + amateur 7K） | ~16K（pro 21K + amateur 4K） | epoch -40%；max_steps=80k 仍綽綽 |
+| Phase 2 amateur 訓練多樣性 | 高但混雜 | 中而乾淨 | M 修飾訊號乾淨；過擬合風險微升 |
+| Phase 0 JSD gate ③ | 已驗 | **必須重跑**（過濾後分布變動） | gate 條件不變 |
+| Phase 1/2 程式架構 | — | — | **完全不變** |
+
+**指令**：
+
+```bash
+# 推薦
+python -m nsvb.data.binarizer --dataset vocalverse \
+    --vocalverse-amateur-score-max 3.0
+
+# Sanity check 標籤分布（不會跑 binarize）
+python -m nsvb.data.vocalverse_mos --vocalverse-root data/VocalVerse
+```
+
+> `--vocalverse-mos-threshold` 為舊 flag、deprecated 但仍相容；推薦改用
+> `--vocalverse-amateur-score-max` 走 pro 4-dim 主信號。
 
 ### 1.2 抽取的特徵（per song → 一個 .npz）
 
