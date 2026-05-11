@@ -66,8 +66,8 @@ data/VocalVerse/VocalVerse_Datasets-human_labels/Amateur_overall_mos_avg5.xlsx
 
 | 資料集 | 檔案數 | mean duration | 總時長 | sample rate | 角色 |
 |---|---:|---:|---:|---:|---|
-| M4Singer | ~21 K（5-sec snippets） | 5.1 s | ~30 h | 48000 | **professional (z_p)** |
-| VocalVerse | 929 full-length recordings | 209 s | ~54 h | 44100 | **amateur (z_a)** |
+| M4Singer | 20,896（5-sec snippets，699 個 `{歌手}#{歌名}` 目錄） | 5.4 s | ~31 h | 48000 | **professional (z_p)** |
+| VocalVerse | 929（full-length recordings，33 個歌手目錄） | 203 s | ~52 h | 44100 | **amateur (z_a)** |
 
 > ⚠ 載入時 `librosa.load(sr=22050, mono=True)` 自動 resample + stereo→mono averaging。
 
@@ -209,7 +209,7 @@ LATENT_FRAME_RATE_HZ = 172.27 / 4  = 43.07 fps  (z, latent)
 | 參數 | 值 | 為什麼 |
 |---|---|---|
 | K | 200 | 中文音素 ~80（不分聲調），但 Whisper hidden state 含 prosody/共發音/音高效應，K=200 給更純的 cluster |
-| frames per song | 200 | 10000 首 × 200 = 2M frames，足以收斂 K=200 |
+| frames per song | 200 | M4 21K snippets × 200 + VV 536 × 200 = ~4.3M frames，足以收斂 K=200 |
 | algorithm | MiniBatchKMeans | 全 frames ~250M 太大，stream batch 8192 fp32 |
 
 ### 1.5 Phase 0 監控與 gate

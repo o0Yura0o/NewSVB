@@ -18,13 +18,13 @@
 | GPU | 1× 24 GB VRAM (e.g. RTX 3090, A5000) | 1× 40 GB+ (A100 / H100) |
 | CUDA driver | 12.1 | 12.1+ |
 | RAM | 64 GB | 128 GB |
-| 磁碟 | 1 TB SSD（dataset + binarize 後 PPG fp16 ~660 GB） | 2 TB NVMe |
+| 磁碟 | 500 GB SSD（raw 42 GB + binarized ~100 GB + ckpts ~20 GB + buffer） | 1 TB NVMe |
 
 **估計時間**（單卡 A100）：
-- Phase 0（資料前處理）：8–14 小時
+- Phase 0（資料前處理）：12–20 小時（含 dereverb + Whisper PPG，~5x realtime）
 - Phase 1（Stage 1 預訓練）：2–3 週
 - Phase 2（Stage 2 訓練）：2–3 週
-- Phase 3（推理整合）：~1 小時
+- Phase 3（推理）：每首 ~1.5s/秒音訊（含 Whisper PPG + DTW + vocoder）
 
 ---
 
@@ -110,35 +110,55 @@ mkdir -p checkpoints/1012_hifigan_all_songs_nsf
 
 ## 4. 下載資料集
 
-### 4.1 VocalVerse（業餘歌聲，~7600 首）
+### 4.1 VocalVerse（業餘歌聲，929 個 full-length 錄音）
 
 ```bash
 python scripts/download_vocalverse.py --out-dir data/VocalVerse
-# 約 80 GB，下載時間視網速 30–120 分鐘
+# 解壓後約 31 GB；33 位歌手 × 約 28 首 = 929 個錄音，每個 ~3.4 分鐘 full-length
+# 下載時間視網速 30–120 分鐘
 ```
 
-### 4.2 M4Singer（職業歌聲，~700 首）
+子目錄結構：
+
+```
+data/VocalVerse/
+├── 443212/                   # 歌曲id（每個目錄一個歌手的所有錄音）
+│   ├── 340406604.wav         # 录音id.wav（一首歌全長）
+│   ├── 341525169.wav
+│   └── ...                    # 該歌手約 28 個錄音
+├── 445425/
+└── VocalVerse_Datasets-human_labels/
+    ├── Amateur_overall_mos_avg5.xlsx                       # 5 位業餘評審 MOS
+    └── Professional_multidim_annotations_raw_...xlsx        # 1 位 pro 教練 4-dim 評分
+```
+
+### 4.2 M4Singer（職業歌聲，20,896 個 5-sec snippets）
 
 去 [M4Singer 官方頁](https://m4singer.github.io/) 下載 zip，解壓到 `data/m4singer/`：
 
 ```
 data/m4singer/
 ├── Alto-1#newboy/
-│   ├── 0000.wav
+│   ├── 0000.wav             # ~5 秒 snippet
 │   ├── 0000.TextGrid
 │   └── ...
 ├── Alto-1#云烟成雨/
-└── ...
+└── ...                       # 699 個 {歌手}#{歌名} 子目錄
 ```
 
-每個 `{歌手}#{歌名}/` 子目錄含多個 `*.wav` 與配套 TextGrid（NSVB-ZH 不使用 TextGrid，但解壓時會一起出來）。
+解壓後約 11 GB。每個 `{歌手}#{歌名}/` 子目錄含多個 `*.wav` 與配套 TextGrid
+（NSVB-ZH 不使用 TextGrid，但解壓時會一起出來）。
 
 ### 4.3 確認結構
 
 ```bash
-ls data/  # 應看到 VocalVerse/  m4singer/
-du -sh data/*  # VocalVerse 約 80 GB，m4singer 約 30 GB
+ls data/                           # 應看到 VocalVerse/  m4singer/
+du -sh data/*                      # 預期：VocalVerse ~31 GB，m4singer ~11 GB
+find data/VocalVerse -name "*.wav" | wc -l    # 預期：929
+find data/m4singer -name "*.wav" | wc -l       # 預期：~20896
 ```
+
+> **時長對照**：VocalVerse 約 **52 h**（929 × ~3.4 min full song），M4Singer 約 **31 h**（21K × ~5.4 sec snippets）。VocalVerse 經 `--vocalverse-amateur-score-max 3.0` 過濾後降至 ~30 h，與 M4Singer 對齊（詳見 [§5.3](#53-binarize-兩個-datasetrisk-2-l1--l2--dereverb--響度正規化)）。
 
 ---
 
@@ -276,7 +296,21 @@ python -m nsvb.data.vocalverse_mos --vocalverse-root data/VocalVerse
 
 #### Binarize 執行說明
 
-每首歌會產出一個 `data/binarized/{dataset}/{item_id}.npz`。**會跑很久**（M4Singer ~21K 5-sec snippets ≈ 6h；VocalVerse 929 long recordings 過濾後 516 筆 ≈ 0.8h）。可以中斷，重跑會自動 skip 已存在的。
+每首歌會產出一個 `data/binarized/{dataset}/{item_id}.npz`。
+
+**時間估計**（A100 GPU；瓶頸是 dereverb 與 Whisper-large-v3 PPG 抽取，~5x realtime）：
+
+| 子集 | 樣本數 | 每樣本長度 | 預估時間 |
+|---|---:|---|---:|
+| M4Singer | 20,896 | ~5 秒 | ~6–10 h |
+| VocalVerse（過濾 amateur_score≤3.0） | 536 | ~3.4 min | ~6–10 h |
+| VocalVerse（不過濾） | 929 | ~3.4 min | ~12–18 h |
+
+可以中斷，重跑會自動 skip 已存在的 `.npz`。CPU-only 推理會慢 5-10×。
+
+**磁碟用量**（PPG fp16 [T, 1280] 是大宗）：
+- 全 binarized（M4 + VV filtered）：~110 GB
+- M4Singer：~46 GB、VocalVerse filtered：~64 GB（每首 ~120 MB × 536）
 
 > **不要加 `--no-dereverb`**——這會違反 Risk 2 主防線。`--no-dereverb` 只在 vocoder identity test、smoke test、或刻意做「無 dereverb」對照實驗時才用。
 
