@@ -164,13 +164,22 @@
 
 ### 一、 核心架構的物理衝突（高風險）
 
-#### 1. M 網路 kernel_size=1 無法生成時間軸動態 — ⚠️ 部分緩解
+#### 1. M 網路 kernel_size 與時間軌跡保存 — ⚠️ 部分緩解
 - **原描述**：kernel_size=1 是 pointwise MLP，無時間感受野；amateur z 若為 flat，無法生成顫音/滑音
-- **判讀**：技術上正確，但漏算了一個事實——顫音/滑音的時間動態本來就在 z_a 裡（encoder 從 mel_a 拿到，下採 4× 後 ~43 fps，仍能解析 5–7 Hz 顫音的 ~8 frame/cycle）。M 不需要「無中生有」，只需「修飾既有 z 朝 pro 分布」
-- **唯一真實風險**：當 amateur 完全沒唱顫音 → z 為 flat → kernel=1 的 pointwise M 確實無法獨力長出顫音；decoder 雖能展現顫音模式，但需要 M 先把 z 移到「正確的 pro subspace 標籤」
-- **已實作緩解**：
-  - [Stage2Trainer.fit](nsvb/task/stage2.py) 在 step ≥ `delta_health_check_step` (30000) 後若 `‖Δ‖/‖z‖` 移動平均 < `delta_health_check_threshold` (0.03) 自動 print 警告，建議切 `--m-kernel-size 3` 重訓
-  - 兩個閾值都暴露在 [Stage2Config](nsvb/task/stage2.py)，可調
+- **判讀重點轉移**：真正的風險不是「kernel=1 能不能表示顫音」（z_a 已含顫音 trajectory），而是「**M 是否動到正確的地方**」——即保留 trajectory + 只改 spectral envelope。kernel 大小只是手段，不是終點。
+- **兩種真實 failure mode**（已實作分別偵測）：
+  - **Mode A：M 太保守**（pointwise 表達力不足）
+    - 偵測：`delta_over_z` 移動平均 < 0.03 持續到 step 30000
+    - 行動：切 `--m-kernel-size 3` 重訓
+  - **Mode B：M 抹平既有 trajectory**（高 Δ/z 但破壞時間結構）
+    - 偵測：`temporal_diff_ratio = mean|Δ_t M(z) − Δ_t z| / mean|Δ_t z|` 移動平均 > 1.0
+    - 解釋：z 自身的時間導數有特定 magnitude；M(z) − z 的時間導數差距若超過 z 自身 → M 把時間結構整個重寫（顫音/滑音被殺或加上不自然抖動）
+    - 行動：降 `lambda_adv_z` 或提早停訓；用 monitor npz 視覺化 delta_mel 確認
+- **已實作緩解**（[Stage2Trainer](nsvb/task/stage2.py)）：
+  - 每 step 計算 `delta_over_z` + `temporal_diff_ratio`，pbar 即時顯示
+  - 30000 步後分別檢查兩條件 → 一次性警告（互斥但可同時觸發）
+  - 兩個閾值都暴露在 [Stage2Config](nsvb/task/stage2.py)：`delta_low_threshold=0.03` / `temporal_diff_high_threshold=1.0`
+  - 每 5000 步 `monitor_audio_quality` 補 **`voiced_spectral_ratio`**：把 voiced 段 Δ_mel 拆成「envelope shift」與「F0 trajectory」兩個時間頻譜分量，≥ 0.7 envelope-dominated 健康；< 0.4 警訊（M 改到 F0 trajectory）
 - **保守選擇**：直接用 `--m-kernel-size 3`，warp-invariance 在 3-frame context (~70 ms) 下只是輕微違反，遠小於音素時長
 
 #### 2. PPG 強制 Resample 50 → 172 fps 子音邊界模糊 — ℹ️ 評估後不需改

@@ -201,11 +201,21 @@ class Stage2Config:
     ckpt_dir: str = "checkpoints/stage2"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ── M 漂移健康檢查（Risk: kernel=1 太保守）─────────────
-    # 若訓 N 步後 delta_over_z 仍 < threshold，print 警告建議切 --m-kernel-size 3。
+    # ── M 健康檢查（兩種 failure mode）─────────────────────
+    # Failure mode A：M 太保守（delta_over_z 過低）— 學不出 pro-style 修飾
+    # Failure mode B：M 抹平既有時間軌跡（temporal_diff_ratio 過高）— 顫音/滑音被殺
+    # 30000 步後若兩條件任一觸發 → print 一次性警告
     # 為什麼 30000 步：L_adv_z 在 5000 步 warmup 結束後正式 active，再給 25000 步
-    # 讓 M 學會基本 mapping；30000 仍 flat 表示 kernel=1 的 pointwise 表達力不夠。
-    # 為什麼 0.03 閾值：經驗值；< 3% 表 M 幾乎沒動 z，pro-style 修飾學不出來
+    # 讓 M 學會基本 mapping；30000 仍異常表示需要介入
+    health_check_step: int = 30000
+    # A：delta_over_z 移動平均 < 0.03 → M 沒動 z（kernel=1 表達力不夠 → 切 kernel=3）
+    delta_low_threshold: float = 0.03
+    # B：temporal_diff_ratio 移動平均 > 1.0 → M 改變的時間導數量級超過 z 本身的時間
+    # 導數（典型 sign of trajectory destruction）
+    # 為什麼 1.0：z 的時間導數本身具有特定 magnitude；若 M(z)-z 的時間導數差距 >
+    # z 自身的時間導數，等於 M 把時間結構整個重寫；< 0.3 健康
+    temporal_diff_high_threshold: float = 1.0
+    # 向後相容 alias（舊欄位名）
     delta_health_check_step: int = 30000
     delta_health_check_threshold: float = 0.03
 
@@ -449,11 +459,24 @@ class Stage2Trainer:
         else:
             m_loss_dict["l_id_pro"] = 0.0
 
-        # ── 監控：‖Δ‖ / ‖z‖ ──
+        # ── 監控：M 動多少 + 動的方向對不對 ──
         with torch.no_grad():
             delta = self.M.delta_only(z_a)
             delta_ratio = (delta.norm() / (z_a.norm() + 1e-6)).item()
+
+            # temporal_diff_ratio：M 是否抹平既有時間軌跡（顫音/滑音）
+            # Δ_t z = z[:, :, 1:] - z[:, :, :-1]  → z 的時間導數
+            # 比較 M(z) 與 z 的時間導數差異：理想情況 M 只動空間方向（spectral envelope
+            # 對應的 z 元件），時間導數的"變化"應與原 z 差不多 → ratio < 0.3
+            # 若 M 把 z 抹平成 const → M(z) 的時間導數變小 → ratio 飆高
+            # 若 M 把 z 加噪 → 同樣 ratio 飆高
+            dz_t = z_a[:, :, 1:] - z_a[:, :, :-1]
+            dM_t = z_a_mapped[:, :, 1:] - z_a_mapped[:, :, :-1]
+            temporal_diff_ratio = (
+                (dM_t - dz_t).abs().mean() / (dz_t.abs().mean() + 1e-6)
+            ).item()
         m_loss_dict["delta_over_z"] = delta_ratio
+        m_loss_dict["temporal_diff_ratio"] = temporal_diff_ratio
 
         self.opt_m.zero_grad()
         m_total.backward()
@@ -578,11 +601,36 @@ class Stage2Trainer:
 
             # 為什麼用「百分比」報告：絕對能量受 z 規模影響，
             # 比例 0.5 = 隨機分布，> 0.6 = M 略偏向 unvoiced（Risk 2 警訊）
+
+            # ── voiced 段 Δ-mel 的時間頻譜拆分 ──
+            # M 在 voiced 段做的「好事」應該是改 spectral envelope / formant 結構
+            # （低時間頻率變化：跨數十 ms 的共鳴調整，frame-to-frame 變化小）
+            # 不該大幅改 F0-related trajectory（高時間頻率變化：顫音/滑音的時間細節）
+            # 拆法：對 Δ_mel 沿時間軸做 1-frame 差分得「高時間頻率分量」；
+            #       (Δ_mel[t] + Δ_mel[t+1]) / 2 = 「低時間頻率分量」（envelope shift）
+            #       voiced_spectral_ratio = low_E / (low_E + high_E)
+            # 經 synthetic test 校準的閾值：
+            #   ≥ 0.7：M 改動以 envelope shift 為主（健康，例如統一加強共鳴）
+            #   0.4–0.7：marginal
+            #   < 0.4：M 改動以高頻時間振盪為主（可能在動 F0 trajectory，警訊）
+            # 為什麼閾值不對稱：random noise 自然落 ~0.2，純 envelope 改動接近 1.0；
+            # 「健康」靠近高端，「失敗」是大幅偏離高端
+            delta_mel_hf = delta_mel[:, 1:, :] - delta_mel[:, :-1, :]
+            delta_mel_lf = (delta_mel[:, 1:, :] + delta_mel[:, :-1, :]) / 2
+            valid_voiced_pair = (valid_voiced[:, 1:] * valid_voiced[:, :-1])
+            voiced_hf_e = (delta_mel_hf.pow(2).sum(-1) * valid_voiced_pair).sum() / valid_voiced_pair.sum().clamp(min=1)
+            voiced_lf_e = (delta_mel_lf.pow(2).sum(-1) * valid_voiced_pair).sum() / valid_voiced_pair.sum().clamp(min=1)
+            voiced_spectral_ratio = (
+                voiced_lf_e / (voiced_lf_e + voiced_hf_e + 1e-10)
+            ).item()
+
             print(f"[stage2-monitor step {self.step}] "
                   f"Δ_voiced_E={voiced_e.item():.4f}  "
                   f"Δ_unvoiced_E={unvoiced_e.item():.4f}  "
                   f"unvoiced_concentration={unvoiced_concentration.item():.3f}  "
-                  f"(< 0.55 良好, 0.55–0.65 marginal, > 0.65 Risk2 警訊)",
+                  f"(< 0.55 良好, > 0.65 Risk2 警訊) "
+                  f"voiced_spectral_ratio={voiced_spectral_ratio:.3f} "
+                  f"(≥ 0.7 envelope-dominated 健康；< 0.4 M 改 F0 trajectory 警訊)",
                   flush=True)
 
             # 存 spectrogram（小，每次只一張 sample）
@@ -598,6 +646,7 @@ class Stage2Trainer:
                 voiced=voiced_n[0].cpu().numpy(),
                 step=np.array(self.step),
                 unvoiced_concentration=np.array(unvoiced_concentration.item()),
+                voiced_spectral_ratio=np.array(voiced_spectral_ratio),
             )
         finally:
             self.M.train()
@@ -614,10 +663,13 @@ class Stage2Trainer:
         t0 = time.time()
         running = {}
         last_logged_step = self.step
-        # Risk: kernel=1 太保守 — 30k 步後 ‖Δ‖/‖z‖ 仍 < threshold 警告一次
+        # 健康檢查 — 30k 步後若 Δ/z 過低 (mode A) 或 temporal_diff_ratio 過高 (mode B)
+        # 各 print 一次性警告
         # 為什麼用 list of recent values 而非單點：避免單步雜訊導致 false positive
         delta_recent: list = []
+        tdr_recent: list = []
         delta_warned = False
+        tdr_warned = False
         while self.step < self.cfg.max_steps:
             metrics = self.train_step()
             self.step += 1
@@ -638,31 +690,53 @@ class Stage2Trainer:
                     "m": f"{avg.get('m_total', 0):.3f}",
                     "d_z": f"{avg.get('d_z', 0):.3f}",
                     "Δ/z": f"{avg.get('delta_over_z', 0):.3f}",
+                    "tdr": f"{avg.get('temporal_diff_ratio', 0):.3f}",
                 })
-                # 收集 delta_over_z 移動平均樣本，留待 30k 步後做健康檢查
+                # 收集移動平均樣本，留待 30k 步後做健康檢查
                 delta_recent.append(avg.get("delta_over_z", 0.0))
+                tdr_recent.append(avg.get("temporal_diff_ratio", 0.0))
                 if len(delta_recent) > 20:
                     delta_recent.pop(0)
+                if len(tdr_recent) > 20:
+                    tdr_recent.pop(0)
                 running = {}
                 last_logged_step = self.step
                 t0 = time.time()
 
-            # Risk: kernel=1 太保守警告（一次性，避免 spam log）
+            # Failure mode A：M 太保守警告（一次性）
             if (not delta_warned
-                    and self.step >= self.cfg.delta_health_check_step
+                    and self.step >= self.cfg.health_check_step
                     and len(delta_recent) >= 10
                     and self.cfg.m_kernel_size == 1):
                 delta_ma = sum(delta_recent) / len(delta_recent)
-                if delta_ma < self.cfg.delta_health_check_threshold:
+                if delta_ma < self.cfg.delta_low_threshold:
                     pbar.write(
-                        f"[stage2] ⚠️  ‖Δ‖/‖z‖ moving avg = {delta_ma:.4f} "
-                        f"< threshold {self.cfg.delta_health_check_threshold} "
+                        f"[stage2] ⚠️  Failure mode A: ‖Δ‖/‖z‖ moving avg = {delta_ma:.4f} "
+                        f"< threshold {self.cfg.delta_low_threshold} "
                         f"after {self.step} steps with kernel_size=1.\n"
-                        f"           M 可能太保守，無法生成顫音/滑音等時間軸動態。\n"
+                        f"           M 動的太少（pointwise 表達力不足）。\n"
                         f"           建議：以 --m-kernel-size 3 重新訓練 "
-                        f"(可從 stage1 ckpt 或當前 stage2 ckpt 接續)。"
+                        f"(可從 stage1 ckpt 接續，M 結構不同無法直接續訓 stage2 ckpt)。"
                     )
                     delta_warned = True
+
+            # Failure mode B：M 抹平時間軌跡警告（一次性）
+            if (not tdr_warned
+                    and self.step >= self.cfg.health_check_step
+                    and len(tdr_recent) >= 10):
+                tdr_ma = sum(tdr_recent) / len(tdr_recent)
+                if tdr_ma > self.cfg.temporal_diff_high_threshold:
+                    pbar.write(
+                        f"[stage2] ⚠️  Failure mode B: temporal_diff_ratio moving avg = "
+                        f"{tdr_ma:.4f} > threshold {self.cfg.temporal_diff_high_threshold} "
+                        f"after {self.step} steps.\n"
+                        f"           M 改動的時間導數量級超過 z 自身 → 顫音/滑音等時間"
+                        f"結構可能被抹平或重寫。\n"
+                        f"           建議：(1) 用 monitor_audio_quality dump 的 npz 視覺化"
+                        f" delta_mel 確認；(2) 若確實有，降 lambda_adv_z 或提早停訓；"
+                        f"(3) 訓 inference 後跑 F0 trajectory 比對。"
+                    )
+                    tdr_warned = True
 
             if self.step % self.cfg.save_interval == 0:
                 self.save_ckpt(tag=f"step{self.step}")

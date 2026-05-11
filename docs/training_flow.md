@@ -38,9 +38,10 @@
 │   loss:  L_PatchNCE + L_adv_z (warmup 5k) + 0.2·L_adv_mel (+ 0.1·L_id_pro)    │
 │                                                                              │
 │ Phase 2 monitors:                                                            │
-│   - D_z accuracy 0.55–0.75, ‖Δ‖/‖z‖ ratio                                    │
-│   - Risk 2 L5: monitor_audio_quality 每 5000 步 (unvoiced_concentration)     │
-│   - Auto-warning: kernel=1 + Δ/z<0.03 @ step 30000                           │
+│   - D_z accuracy 0.55–0.75, ‖Δ‖/‖z‖ (magnitude), tdr (trajectory)            │
+│   - Risk 2 L5: monitor_audio_quality 每 5000 步                              │
+│     (unvoiced_concentration + voiced_spectral_ratio)                         │
+│   - Auto-warning: failure mode A (Δ/z<0.03) / B (tdr>1.0) @ step 30000       │
 └──────────────────────────────────────┬───────────────────────────────────────┘
                                        │
 ┌──────────────────────────────────────▼───────────────────────────────────────┐
@@ -605,31 +606,63 @@ D_mel 的更新（pro real only）：
 | `l_id_pro` | 20% 步抽中時 ~ 0.05–0.2 | M 在 pro 端沒亂改 |
 | **`d_z`** | **~ 0.5–1.5** | < 0.3：D_z 太弱（real fake 都信，M 不需學）；> 2：D_z 太強 M 學不動 |
 | `d_mel` | ~ 0.5–1.5 | 同上 |
-| **`delta_over_z`** ⭐ | **0.03–0.20** | 這是「**M 漂移程度**」核心指標：< 0.03 → M 太保守；> 0.30 → M 過度激進可能破壞內容 |
+| **`delta_over_z`** ⭐ | **0.03–0.30** | M **動多少**（magnitude）：< 0.03 → 太保守；> 0.30 → 過度激進可能破壞內容 |
+| **`temporal_diff_ratio`** ⭐ | **< 0.3** | M **動的方向對不對**（trajectory preservation）：mean\|Δ_t M(z) − Δ_t z\| / mean\|Δ_t z\|；< 0.3 = M 只動 spectral 方向不抹平時間軌跡（健康，顫音/滑音保留）；> 1.0 = M 改變的時間導數量級超過 z 自身 → trajectory 被抹平或重寫（警訊）|
+
+> **`delta_over_z` 與 `temporal_diff_ratio` 共同判讀**：
+> | Δ/z | tdr | 含義 |
+> |---|---|---|
+> | 低 (<0.03) | 低 | M ≈ identity，沒在學（**Failure mode A**） |
+> | 高 (>0.05) | 低 (<0.3) | ⭐ **健康**：M 動 spectral envelope，trajectory 不變 |
+> | 高 | 高 (>1.0) | M 改動把時間結構抹平或重寫（**Failure mode B**） |
+> | 低 | 高 | 罕見；M 幾乎不動但偶爾大幅震盪，檢查 dataset 是否異常 |
 
 #### 3.6.2 Risk 2 L5：訓中音質監控
 
 [Stage2Trainer.monitor_audio_quality](../nsvb/task/stage2.py)（每 `audio_quality_monitor_interval`=5000 步觸發一次）：
 1. 抽 `audio_quality_monitor_n_samples`（=4）個 amateur 樣本
 2. 算 `Δ_mel = mel_modified − mel_baseline`（modified=過 M；baseline=不過 M）
-3. 比較 voiced 段 vs unvoiced 段 Δ 能量
+3. 同時報告兩個 ratio：
 
-判讀（[risk.md](../risk.md) Risk 2 補強 4）：
+**(a) `unvoiced_concentration` — 跨 voicing 切分**
 
-| `unvoiced_concentration` | 含義 | 行動 |
+| 值 | 含義 | 行動 |
 |---|---|---|
 | < 0.55 | M 修飾集中在 voiced 段 — 真技術修正 | 繼續訓 |
 | 0.55–0.65 | marginal | 留意，再觀察 5000 步 |
-| > 0.65 | **Risk 2 警訊** — M 在去殘響/降噪 | 停下來，resume + `--dmel-mix-amateur-real` 救火 |
+| > 0.65 | **Risk 2 警訊** — M 在去殘響/降噪 | resume + `--dmel-mix-amateur-real` 救火 |
 
-每次抽樣會把 mel spectrogram 對比存到 `checkpoints/stage2/audio_monitor/step{N}_sample0.npz`（含 `mel_gt / mel_baseline / mel_modified / delta_mel / unvoiced_concentration`），可用 matplotlib 視覺化檢查。
+**(b) `voiced_spectral_ratio` — voiced 段內部的時間頻譜拆分**
+
+把 voiced 段的 `Δ_mel` 沿時間軸拆成「低時間頻率」(envelope shift) 與「高時間頻率」(F0 trajectory 動態) 兩個分量：
+
+| 值 | 含義 | 行動 |
+|---|---|---|
+| ≥ 0.7 | ⭐ M 改動以 envelope shift 為主（健康；統一加強共鳴/亮度） | 繼續訓 |
+| 0.4–0.7 | marginal | 觀察 |
+| < 0.4 | M 改動以高頻時間振盪為主 → 可能在動 F0 trajectory（抹平顫音或加抖動）| 配合 tdr 與聽測診斷 |
+
+每次抽樣會把 mel spectrogram 對比存到 `checkpoints/stage2/audio_monitor/step{N}_sample0.npz`，含：
+- `mel_gt / mel_baseline / mel_modified / delta_mel`（視覺化）
+- `f0 / voiced`（標 voicing）
+- `unvoiced_concentration / voiced_spectral_ratio`（標量指標）
+
+可用 matplotlib 視覺化檢查。
 
 #### 3.6.3 Auto-warnings（一次性 print）
 
-| 條件 | 訊息 | 處理 |
-|---|---|---|
-| step ≥ `delta_health_check_step`(30000) 且 `‖Δ‖/‖z‖` 移動平均 < `delta_health_check_threshold`(0.03) 且 `m_kernel_size==1` | "M 可能太保守，無法生成顫音/滑音；建議 `--m-kernel-size 3` 重訓" | 停下來換 kernel=3 重訓（M 結構改了，需從 stage1 ckpt 重啟）|
-| `T_z < 4`（PatchNCE）| RuntimeWarning：建議 max_frames ≥ 64 | 調大 `--max-frames` |
+兩種 M failure mode，分別偵測：
+
+| 條件 | Failure mode | 訊息 | 處理 |
+|---|---|---|---|
+| step ≥ `health_check_step`(30000) 且 `‖Δ‖/‖z‖` 移動平均 < `delta_low_threshold`(0.03) 且 `m_kernel_size==1` | **A：M 太保守** | "M 動的太少（pointwise 表達力不足），建議 `--m-kernel-size 3` 重訓" | 從 stage1 ckpt 接續（M 結構變了，stage2 ckpt 不能直接 resume） |
+| step ≥ `health_check_step`(30000) 且 `temporal_diff_ratio` 移動平均 > `temporal_diff_high_threshold`(1.0) | **B：M 抹平 trajectory** | "顫音/滑音等時間結構可能被抹平或重寫" | (1) 用 monitor npz 視覺化 delta_mel 確認；(2) 降 `lambda_adv_z` 或提早停訓；(3) 跑 F0 trajectory 比對 |
+| `T_z < 4`（PatchNCE）| 訓練配置錯 | RuntimeWarning：建議 max_frames ≥ 64 | 調大 `--max-frames` |
+
+> Failure mode A 與 B 互斥但可同時觸發：
+> - 只 A：M 幾乎沒動（kernel=1 表達力問題，切 kernel=3）
+> - 只 B：M 動得太多且方向錯（過度激進）
+> - A+B：罕見，通常是訓練不穩定，檢查 loss 與 dataset 完整性
 
 #### 3.6.4 D_z accuracy（外掛 monitor，可選）
 
@@ -887,8 +920,16 @@ optim TTUR: lr_M=1e-4, lr_Dz=4e-4, lr_Dmel=1e-5  (β=(0.5, 0.999))
 batch=16, max_frames=600, max_steps=120k
 
 D_mel real source: pro-only (default) | pro+amateur if --dmel-mix-amateur-real
-auto-warning: kernel=1 + Δ/z<0.03 @ step 30000
-audio quality monitor every 5000 steps (Risk 2 L5)
+
+monitors (per log_interval=50):
+  - delta_over_z          (M 動多少, healthy 0.03–0.30)
+  - temporal_diff_ratio   (M 是否抹平 trajectory, healthy < 0.3)
+audio quality monitor (per audio_quality_monitor_interval=5000):
+  - unvoiced_concentration   (Risk 2 L5, < 0.55 healthy)
+  - voiced_spectral_ratio    (M 改 envelope vs F0 traj, ≥ 0.7 healthy)
+auto-warnings @ step 30000:
+  - failure mode A: Δ/z < 0.03 + kernel_size=1  → 切 kernel=3
+  - failure mode B: tdr   > 1.0                  → M 抹平 trajectory
 ```
 
 ---

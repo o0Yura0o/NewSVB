@@ -38,3 +38,4 @@ build/
 *.pptx
 .claude/
 NSVB-ZH_ver1/
+tmp_reference.md
