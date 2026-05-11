@@ -39,3 +39,4 @@ build/
 .claude/
 NSVB-ZH_ver1/
 tmp_reference.md
+outputs/

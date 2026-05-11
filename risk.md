@@ -191,6 +191,18 @@
   - Nearest 反而會引入 step-function 跳變對下游梯度更不友善
 - **行動**：不改程式碼。若 Phase 2 試聽**確認**有咬字模糊，再做 ablation（`mode="nearest"` + 1D smoothing conv）
 
+#### 2b. Whisper PPG 對 singing 的 pitch 污染 — ⚠️ 部分緩解（Phase 0 gate 偵測）
+- **原描述**：Whisper 是 speech-heavy 模型；唱歌的延音、vibrato、melisma、非語音段可能讓 hidden state 混入 pitch / prosody 資訊
+- **判讀**：layer 8 雖近 phonetic 但沒完全把 prosody 抽掉。對 speech 是小量、對 singing（pitch 是主要變異）會被 k-means 放大成「同一母音不同 pitch → 不同 cluster」。最終 failure mode：`phoneme_id` 與 `register_id` 強相關 → D_z 的兩個 condition 實質塌成一個 → **隱形版 Risk 6 F0 shortcut**
+- **架構部分保護**：
+  - Decoder 取顯式 F0 + spk_emb（dominant pitch signal 不靠 PPG）
+  - D_z 用 discrete cluster id 而非連續 PPG（有限分桶）
+  - Gate ③ JSD 已檢查跨 dataset 分布，但**看不到同 dataset 內部** cluster ↔ register 相關性
+- **已實作緩解**：
+  - 新增 **Gate ④** [`scripts/cluster_ppg_inspect.py`](scripts/cluster_ppg_inspect.py)：抽樣計算 `MI(phoneme_id; register_id)` 與 voiced 段 cluster dwell length；同時畫時間序列疊圖供眼睛交叉檢查 sustained / vibrato 段 cluster 是否穩定
+  - 健康閾值：`MI < 0.3 bit`、`mean dwell ≥ 8 frames`
+- **WARNING 補救順序**：降 K → 換 Whisper layer (6 或 10) → PPG per-utterance 去 DC → phoneme_id mode filter
+
 ---
 
 ### 二、 訓練動態與 Loss 設計（中風險）

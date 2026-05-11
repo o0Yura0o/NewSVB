@@ -20,6 +20,7 @@
 │ Phase 0 gate ① Vocoder identity test  SSIM ≥ 0.90, F0 RMSE ≤ 10 Hz           │
 │ Phase 0 gate ② Audio quality probe    SFM/Reverb/HF/SNR JSD < 0.10           │
 │ Phase 0 gate ③ JSD(register / phoneme) < 0.05                                │
+│ Phase 0 gate ④ PPG cluster: MI(phoneme;register) < 0.3, dwell ≥ 8 frames     │
 └──────────────────────────────────────┬───────────────────────────────────────┘
                                        │
 ┌──────────────────────────────────────▼───────────────────────────────────────┐
@@ -266,6 +267,36 @@ LATENT_FRAME_RATE_HZ = 172.27 / 4  = 43.07 fps  (z, latent)
 | JSD(VocalVerse register dist, M4Singer register dist) | < 0.05 | 重採樣 register distribution |
 
 **為什麼必要**：D_z 用 phoneme + register 當條件；若兩 dataset 的 phoneme 頻率分布有大差別（例如 M4Singers 比例壓倒性高男聲），D_z 看到「phoneme 出現比例」就能猜業餘/職業，把 M 引導到亂改。
+
+#### Gate ④：PPG cluster 品質 / pitch 污染檢查
+
+**腳本**：`scripts/cluster_ppg_inspect.py`。
+
+**為什麼必要**：Whisper layer 8 是 phonetic 層，但**沒完全把 prosody 抽掉**——對 speech 是小量、對 singing（pitch 是主要變異）會被 k-means 放大成「同一母音不同 pitch 切到不同 cluster」。結果：`phoneme_id` 序列與 `register_id` 序列高度相關 → D_z 的 phoneme + register 兩個條件實質塌成一個 → **隱形版 F0 shortcut**（Risk 6 死灰復燃）。Gate ③ JSD 只看跨 dataset 分布差異，看不到同 dataset 內部的 cluster-register 相關性，所以需要這個 Gate。
+
+| 指標 | HEALTHY | MARGINAL | WARNING |
+|---|---:|---|---|
+| `MI(phoneme_id; register_id)` (bit) | < 0.3 | 0.3–0.6 | ≥ 0.6 (cluster 被 pitch 污染) |
+| `mean_dwell_frames_voiced` | ≥ 8 (~46 ms) | 3–8 | < 3 (cluster 切太細，frame-by-frame 跟 pitch 跳) |
+
+**輸出**：
+- `outputs/phase0_cluster_inspect/{dataset}/timeseries_NN_*.png`：抽 N 首歌畫 `phoneme_id` + F0 + voicing 三層疊圖，眼睛交叉檢查 sustained 音/vibrato/換氣段 cluster 是否穩定
+- `outputs/phase0_cluster_inspect/{dataset}/dwell_histogram.png`：voiced 段內 cluster dwell length 分布 + 健康閾值線
+- `report.json`：所有量化指標
+
+**指令**：
+```bash
+python -m scripts.cluster_ppg_inspect \
+    --binarized-root data/binarized \
+    --datasets m4singer vocalverse \
+    --phoneme-vocab-size 200
+```
+
+**WARNING 補救**（依優先級）：
+1. **降 K**（200 → 100）：粗化 cluster，避免 pitch 微差分到不同桶
+2. **換 Whisper layer**（試 layer 6 或 10）：layer 6 更近聲學表徵（pitch 訊號可能少）、layer 10 更近語意（音色 invariance 更強）
+3. **PPG per-utterance 去 DC**：binarize 時對每首歌 `ppg -= ppg.mean(axis=0)`，去除說話人/錄音常數偏移，再 k-means
+4. **phoneme_id mode filter**：對輸出 `phoneme_id` 跑長度 5 的 mode filter 平滑掉 1-2 frame 的瞬時跳變
 
 ---
 
@@ -977,6 +1008,10 @@ PYTHONPATH=. python -m nsvb.data.cluster_ppg \
 
 # Gate ③：JSD（register / phoneme）檢查
 PYTHONPATH=. python -m nsvb.utils.jsd_check  # 檢查 phoneme/register JSD < 0.05
+
+# Gate ④：PPG cluster 品質（MI / dwell 檢查）
+PYTHONPATH=. python -m scripts.cluster_ppg_inspect \
+    --datasets m4singer vocalverse --phoneme-vocab-size 200
 
 # === Phase 1：Stage 1 CVAE 預訓練 ===
 PYTHONPATH=. python -m nsvb.task.stage1 \

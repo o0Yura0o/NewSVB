@@ -336,11 +336,38 @@ python -m nsvb.data.cluster_ppg \
 
 執行後每個 .npz 多一個 `phoneme_id` key（int16, [T_mel]）。約 30–60 分鐘。
 
-### 5.5 JSD 檢查（Phase 0 gate ②）
+### 5.5 PPG cluster 品質檢查（Phase 0 gate ④）⭐
+
+Whisper 是 speech-heavy 模型，layer 8 雖近 phonetic 但**沒完全把 prosody 抽掉**；對 singing（pitch 是主要變異）會被 k-means 放大成「同一母音不同 pitch → 不同 cluster」，導致 `phoneme_id` 與 `register_id` 強相關 → D_z 兩個條件實質塌成一個（**隱形 F0 shortcut**）。
+
+```bash
+python -m scripts.cluster_ppg_inspect \
+    --binarized-root data/binarized \
+    --datasets m4singer vocalverse \
+    --phoneme-vocab-size 200 \
+    --out-dir outputs/phase0_cluster_inspect
+```
+
+**通過條件**（兩 dataset 都要）：
+- `MI(phoneme_id; register_id)` < 0.3 bit（< 0.6 為 marginal）
+- `mean_dwell_frames_voiced` ≥ 8（< 3 為 warning）
+
+**腳本同時產出**：
+- 抽 5 首歌的 `phoneme_id` + F0 + voicing 三層疊圖（眼睛交叉檢查 sustained 音/vibrato 段 cluster 是否穩定）
+- voiced 段 dwell length 分布 histogram
+- `report.json` 含完整指標
+
+**WARNING 補救**（依優先級嘗試）：
+1. 降 K（`--k 100` 重跑 cluster_ppg）：粗化 cluster 避免 pitch 微差分到不同桶
+2. 換 Whisper layer（[audio_config.py](../nsvb/utils/audio_config.py) 改 `WHISPER_HIDDEN_LAYER`）試 6 或 10
+3. binarize 時對 PPG 做 per-utterance 去 DC（暫時需手動改 [binarizer.py](../nsvb/data/binarizer.py) 在存 `ppg` 前 `ppg -= ppg.mean(0)`）
+4. 對輸出 `phoneme_id` 跑長度 5 mode filter 平滑
+
+### 5.6 JSD 檢查（Phase 0 gate ③）
 
 讓 binarized 資料的 register/phoneme 分布跨 dataset JSD < 0.05（沒有單一 CLI；需要寫小 script 或 jupyter，本文略過。實作上可開 python REPL 對 .npz 統計）。
 
-### 5.6 Phase 0 通過？
+### 5.7 Phase 0 通過？
 
 ```bash
 # 確認所有 gate 都過
