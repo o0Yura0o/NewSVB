@@ -278,7 +278,14 @@ VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/mod
     pandas==2.2.2 openpyxl==3.1.5 tensorboard==2.17.0 tqdm==4.66.4 \
     pyyaml==6.0.2 \
     matplotlib==3.9.1 portalocker==2.10.1 filelock==3.15.4 tabulate==0.9.0 \
+    "protobuf>=5.28.0" \
     -q
+
+# ⚠ protobuf>=5.28 必要：Colab 預載的 sentencepiece（Whisper tokenizer 依賴）
+# 是用 protobuf 5.x 工具鏈生成的，需要 runtime_version API（5.26+ 才有）。
+# tensorboard==2.17.0 雖 explicit 要求 protobuf<5，但 Stage 1/2 寫 event 檔功能
+# 與 protobuf 5+ 仍相容；不裝 protobuf 5 反而會在 binarize 載 Whisper 時
+# `cannot import name 'runtime_version' from 'google.protobuf'`
 
 # ⭐ 必要：裝完後 restart runtime
 # 因為 §3.2 之前 import 過 numpy（mount Drive 也會載 numpy），降版後的新 .so
