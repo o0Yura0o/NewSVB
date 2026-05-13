@@ -101,7 +101,7 @@ mkdir -p checkpoints/1012_hifigan_all_songs_nsf
 
 # 把下載好的 ckpt 放到對應目錄：
 #   checkpoints/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt
-#   checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt
+#   checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt
 #   checkpoints/1012_hifigan_all_songs_nsf/config.yaml
 ```
 
@@ -187,7 +187,7 @@ NSVB-ZH 最大的訓練風險是 **Risk 2 — 音質域與技術域混淆**：M4
 
 ```bash
 python -m scripts.vocoder_identity_test \
-    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
     --n-per-dir 20 \
     --save-wavs \
@@ -198,7 +198,7 @@ python -m scripts.vocoder_identity_test \
 
 ```bash
 python -m scripts.vocoder_identity_test \
-    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
     --n-per-dir 20 \
     --save-wavs \
@@ -602,7 +602,7 @@ python -m nsvb.task.stage2 \
 ```bash
 python -m scripts.infer \
     --stage2-ckpt checkpoints/stage2/stage2_latest.pt \
-    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --input-a path/to/amateur.wav \
     --output outputs/mode_a_result.wav
 ```
@@ -612,7 +612,7 @@ python -m scripts.infer \
 ```bash
 python -m scripts.infer \
     --stage2-ckpt checkpoints/stage2/stage2_latest.pt \
-    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --input-a path/to/amateur.wav \
     --pro-ref path/to/pro_reference.wav \
     --output outputs/mode_b_result.wav
@@ -639,7 +639,7 @@ Stage 2 ckpt 內紀錄了訓練機上的 Stage 1 路徑；遷到別機需顯式�
 python -m scripts.infer \
     --stage2-ckpt checkpoints/stage2/stage2_latest.pt \
     --stage1-ckpt checkpoints/stage1/stage1_latest.pt \
-    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --input-a path/to/amateur.wav \
     --output outputs/result.wav
 ```

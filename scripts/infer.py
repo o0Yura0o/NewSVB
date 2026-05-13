@@ -7,7 +7,7 @@ NSVB-ZH 推理 CLI。對應 rebuild_checklist §H 的兩種推理模式：
 
     Mode A：python -m scripts.infer
               --stage2-ckpt checkpoints/stage2/stage2_latest.pt
-              --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt
+              --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt
               --input-a path/to/amateur.wav
               --output  path/to/out.wav
 

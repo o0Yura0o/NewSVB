@@ -837,7 +837,7 @@ if T_mel % factor != 0:
 # Mode A（預設）：業餘 → 修飾後 wav，配原伴奏
 python -m scripts.infer \
     --stage2-ckpt checkpoints/stage2/stage2_latest.pt \
-    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --input-a path/to/amateur.wav \
     --output outputs/mode_a_result.wav
 
@@ -865,7 +865,7 @@ from nsvb.inference import load_inference_models, run_mode_a
 
 models = load_inference_models(
     stage2_ckpt="checkpoints/stage2/stage2_latest.pt",   # 含 M weights + 對 stage1 路徑引用
-    vocoder_ckpt="checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt",
+    vocoder_ckpt="checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt",
     stage1_ckpt=None,    # None = 用 stage2 ckpt 內紀錄的路徑；跨機器時覆寫
     device="cuda",
 )
@@ -987,7 +987,7 @@ auto-warnings @ step 30000:
 # === Phase 0：資料二進位化 ===
 # Gate ①：vocoder identity test（先確認 vocoder 不是 bottleneck）
 PYTHONPATH=. python -m scripts.vocoder_identity_test \
-    --vocoder-ckpt /path/to/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt /path/to/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
     --n-per-dir 20 --save-wavs \
     --out-dir outputs/phase0_vocoder
@@ -1036,7 +1036,7 @@ PYTHONPATH=. python -m nsvb.task.stage2 \
 # Mode A（預設）：業餘 → 修飾後 wav，配原伴奏
 PYTHONPATH=. python -m scripts.infer \
     --stage2-ckpt checkpoints/stage2/stage2_latest.pt \
-    --vocoder-ckpt /path/to/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt \
+    --vocoder-ckpt /path/to/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt \
     --input-a path/to/amateur.wav \
     --output outputs/mode_a_result.wav
 

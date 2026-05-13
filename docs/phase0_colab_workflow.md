@@ -169,7 +169,7 @@ Phase 0 Gate ① 需要。上傳到你的 Drive 任意位置，記下路徑（St
 
 ```python
 # ⚠ 改成你實際的路徑
-VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt'
+VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt'
 !ls -lh "{VOCODER_CKPT}"
 ```
 
@@ -219,7 +219,7 @@ os.environ['HF_HOME'] = f'{WORK}/hf_cache'
 print('HF_HOME =', os.environ['HF_HOME'])
 
 # Stage A 上傳的 vocoder ckpt 路徑（改成你的實際路徑）
-VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt'
+VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt'
 ```
 
 ### 3.3 重新 git clone + 對齊 commit
@@ -256,21 +256,34 @@ VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/mod
 !pip install /content/drive/MyDrive/NSVB-ZH/wheels/DeepFilterLib-*.whl \
              /content/drive/MyDrive/NSVB-ZH/wheels/deepfilternet-*.whl -q
 
-# 其餘依賴（注意：deepfilternet 已從 Drive 裝好，這裡不再列）
+# 其餘依賴。
+# ⚠ --force-reinstall 必要：Colab A100 runtime 預載的 scipy/sklearn/librosa 等
+#   是對 numpy 2.x 編譯的；pip 看版本號相同會 skip，但 .so 仍是舊的 → 後續
+#   import 會踩 ABI mismatch `numpy.dtype size changed, may indicate binary
+#   incompatibility. Expected 96 from C header, got 88 from PyObject`
+# 為什麼不全 --force-reinstall 整個 list：太慢、且非 C 擴展套件不需要
+!pip install --force-reinstall --no-deps --no-cache-dir \
+    numpy==1.26.4 scipy==1.13.0 librosa==0.10.2 soundfile==0.12.1 \
+    resampy==0.4.3 scikit-learn==1.5.1 scikit-image==0.24.0 -q
+
 !pip install \
     pytorch-lightning==1.9.5 \
-    numpy==1.26.4 scipy==1.13.0 librosa==0.10.2 soundfile==0.12.1 \
     pyloudnorm==0.1.1 \
     "pyworld>=0.3.5" "praat-parselmouth>=0.4.5" \
-    webrtcvad==2.0.10 resampy==0.4.3 einops==0.8.0 \
+    webrtcvad==2.0.10 einops==0.8.0 \
     torchcrepe==0.0.24 \
     resemblyzer==0.1.4 pypinyin==0.53.0 g2pM==0.1.2.5 jieba==0.42.1 \
     transformers==4.40.0 huggingface-hub==0.24.0 tokenizers==0.19.1 \
     datasets==2.20.0 accelerate==0.30.0 \
     pandas==2.2.2 openpyxl==3.1.5 tensorboard==2.17.0 tqdm==4.66.4 \
-    pyyaml==6.0.2 scikit-learn==1.5.1 scikit-image==0.24.0 \
+    pyyaml==6.0.2 \
     matplotlib==3.9.1 portalocker==2.10.1 filelock==3.15.4 tabulate==0.9.0 \
     -q
+
+# ⭐ 必要：裝完後 restart runtime
+# 因為 §3.2 之前 import 過 numpy（mount Drive 也會載 numpy），降版後的新 .so
+# 不會生效，必須 restart Python process 才能載入一致版本
+print("\n=== 請手動 Runtime → Restart runtime（Ctrl+M .），然後重做 §3.2 / §3.3 / §3.5（不用重跑 §3.4）===")
 ```
 
 > **若 wheel 路徑不存在**（沒做 Stage A §2.4 步驟 4 的 `pip wheel`）：
@@ -651,7 +664,7 @@ diff <(jq '.datasets' outputs/phase0_cluster_inspect/report.json) \
 
 ```bash
 ls -lh checkpoints/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt
-ls -lh checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1512000.ckpt
+ls -lh checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt
 ```
 
 若沒有，按 [deployment_linux.md §3](deployment_linux.md) 下載。
