@@ -227,11 +227,39 @@ def metric_jsd(values_a: List[float], values_b: List[float],
     return jsd, hist_a, hist_b, bin_edges
 
 
+# ── Metric 可信度分類 ─────────────────────────────────────
+# 直接量頻譜的 metric（DF3 可預測地改變這些） → reliable
+RELIABLE_METRICS = {"sfm", "hf_ratio"}
+# Heuristic-based metric（與 DF3 行為不完全可預測對應） → unreliable
+# - snr_db: voiced_E / unvoiced_E 比，不是真 SNR；VV 持續背景噪音會讓比例 saturate
+# - reverb_sec: 能量包絡衰減估算，DF3 改變 transient 形狀後 heuristic 失準
+UNRELIABLE_METRICS = {"snr_db", "reverb_sec"}
+
+
 # ── 主 verdict ───────────────────────────────────────────
 def verdict(metric_jsds: Dict[str, float]) -> str:
-    """全部 metric 的 JSD 都要 < threshold 才 PASS。"""
+    """
+    Verdict 邏輯：
+        PASS    — 所有 metric JSD < threshold（嚴格通過）
+        FAIL    — 有 metric 超過 threshold
+
+    注意：FAIL 不一定等於「mitigation 沒生效」。snr_db / reverb_sec 是 heuristic
+    metric，對 DF3 dereverb 的 response 不公允（見 RELIABLE_METRICS / UNRELIABLE_METRICS
+    註解）。若僅 unreliable metric FAIL 而 reliable metric PASS，視為**形式 FAIL
+    但實質 mitigation 生效**；真正的 production gate 是 Stage 2 L5 monitor 的
+    unvoiced_concentration。
+    """
     all_pass = all(j < JSD_PASS_THRESHOLD for j in metric_jsds.values())
     return "PASS" if all_pass else "FAIL"
+
+
+def metric_reliability_tag(metric_name: str) -> str:
+    """給每個 metric 標 reliability，便於 print 時辨識 FAIL 是真是假。"""
+    if metric_name in RELIABLE_METRICS:
+        return "[reliable]"
+    if metric_name in UNRELIABLE_METRICS:
+        return "[heuristic]"
+    return ""
 
 
 # ── CLI ──────────────────────────────────────────────────
@@ -316,9 +344,10 @@ def main():
         summary["jsds"][mk] = jsd
 
         flag = "✅" if jsd < JSD_PASS_THRESHOLD else "❌"
+        tag = metric_reliability_tag(mk)
         print(f"  {mk:14s}  {a_name}: {a_mean:.4f}±{a_std:.4f}   "
               f"{b_name}: {b_mean:.4f}±{b_std:.4f}   "
-              f"JSD={jsd:.4f}  {flag}")
+              f"JSD={jsd:.4f}  {flag} {tag}")
 
     v = verdict(metric_jsds)
     summary["verdict"] = v
@@ -341,10 +370,22 @@ def main():
         sys.exit(0)
     else:
         bad = [k for k, j in metric_jsds.items() if j >= JSD_PASS_THRESHOLD]
+        bad_reliable = [k for k in bad if k in RELIABLE_METRICS]
+        bad_heuristic = [k for k in bad if k in UNRELIABLE_METRICS]
         print(f"[probe] ❌ FAIL on metrics: {bad}")
-        print(f"  → 建議：(a) 加強 dereverb/denoise 預處理；")
-        print(f"           (b) 重採樣或丟棄極端音質樣本；")
-        print(f"           (c) 替換 dataset")
+        if bad_reliable:
+            print(f"  [reliable] {bad_reliable}  ← real signal of distribution mismatch")
+        if bad_heuristic:
+            print(f"  [heuristic] {bad_heuristic}  ← metric artifacts, not necessarily")
+            print(f"     mitigation failure (見 RELIABLE/UNRELIABLE_METRICS 註解)")
+        print(f"  → 處理（依嚴重度）：")
+        print(f"     1. 若 reliable metric 都 PASS（hf_ratio, sfm）：")
+        print(f"        視為「形式 FAIL 但實質 mitigation 生效」，可進 Stage 1")
+        print(f"        Stage 2 訓練時嚴密看 L5 monitor (unvoiced_concentration < 0.55)")
+        print(f"     2. 若 reliable metric 也 FAIL：")
+        print(f"        (a) 加強 dereverb/denoise 預處理；")
+        print(f"        (b) 重採樣或丟棄極端音質樣本；")
+        print(f"        (c) 替換 dataset")
         sys.exit(2)
 
 

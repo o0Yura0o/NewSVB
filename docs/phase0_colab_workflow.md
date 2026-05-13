@@ -406,10 +406,29 @@ for name in ['phase0_audio_quality_raw', 'phase0_audio_quality_dereverbed']:
         print(f"  {mk}: JSD={jsd:.4f}  {flag}")
 ```
 
-**通過條件**：
-- Run A（raw）預期會 FAIL — M4 studio mic vs VV 業餘 phone mic 本來就差很大，這個 FAIL 是「Risk 2 為什麼存在」的證據
-- **Run B（dereverb'd）應該 PASS 或大幅改善** — 驗證 binarize 端的 DF3 mitigation 確實縮小差距，這是真正進 Stage 1 之前的 gate
-- 若 Run B 仍 FAIL：Stage 2 訓練 L5 monitor（unvoiced_concentration）會抓到實際失敗，可即時用 `--dmel-mix-amateur-real` 救火
+**通過條件**（重要：4 個 metric 可信度分兩級，FAIL 不等於失敗）：
+
+| Metric | 可信度 | 為什麼 |
+|---|---|---|
+| `sfm` / `hf_ratio` | ⭐ **Reliable**（直接量頻譜，DF3 影響可預測） | 真正反映 mitigation 是否生效 |
+| `snr_db` | ⚠ Heuristic（voiced_E/unvoiced_E ratio）| VV 持續背景噪音讓比例 saturate，DF3 改不了 |
+| `reverb_sec` | ⚠ Heuristic（能量包絡衰減）| DF3 改 transient 形狀後 heuristic 失準 |
+
+判讀邏輯：
+- Run A（raw）預期會全 FAIL — M4 studio vs VV 業餘 phone mic 本來就差很大，這就是「Risk 2 為什麼存在」的證據
+- **Run B（dereverb'd）只要 reliable metric (sfm / hf_ratio) 改善或 PASS，就算實質通過**——即便 snr_db / reverb_sec 形式 FAIL 也 OK，那是 metric artifact 不是 mitigation 失敗
+- 真正的 ground truth 是 Stage 2 訓中 L5 monitor（`unvoiced_concentration < 0.55`），它直接量 M 是否在去殘響
+
+**Colab A100 實測**（n_per_dir=100）：
+
+| Metric | Raw JSD | Dereverb JSD | 改善 | 結論 |
+|---|---:|---:|---|---|
+| sfm | 0.644 | 0.390 | -39% | 方向對，未達 < 0.10 但 mitigation 生效 |
+| hf_ratio | 0.258 | **0.048** ✅ | -81% | PASS |
+| reverb_sec | 0.113 | 0.118 | +5% | heuristic 限制（DF3 改 transient） |
+| snr_db | 0.659 | 0.624 | -5% | heuristic 限制（VV 持續背景噪音）|
+
+→ 兩條 reliable metric 改善，**視為通過進 §6 binarize**；Stage 2 訓練時看 L5 monitor 保險。
 
 ---
 

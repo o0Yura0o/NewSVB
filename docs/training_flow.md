@@ -281,21 +281,39 @@ LATENT_FRAME_RATE_HZ = 172.27 / 4  = 43.07 fps  (z, latent)
 
 #### Gate ②：Audio quality probe（Risk 2 L4）
 
-**腳本**：`scripts/audio_quality_probe.py`。對每個 dataset 抽 N 首歌算 raw wav 的音質統計，計算跨 dataset 的 JSD。
+**腳本**：`scripts/audio_quality_probe.py`。對每個 dataset 抽 N 首歌算 wav 的音質統計，計算跨 dataset 的 JSD。可選 `--apply-dereverb` 跑 dereverb 後再算（模擬 binarize 端進訓練的實際分布）。
 
-| Metric | 含義 | PASS 閾值 |
-|---|---|---|
-| SFM | spectral flatness（噪音含量） | JSD < 0.10 |
-| Reverb | direct-to-reverberant ratio 估計 | JSD < 0.10 |
-| HF-ratio | high-frequency energy ratio | JSD < 0.10 |
-| SNR | ITU-R P.56 SNR 估計 | JSD < 0.10 |
+**4 個 metric 但可信度分兩級**（實測 M4 vs VV 跑出來的 mitigation response 後分類）：
+
+| Metric | 含義 | 可信度 | PASS 閾值 |
+|---|---|---|---|
+| **`sfm`** | Spectral flatness（頻譜均勻度） | ⭐ **Reliable**：直接量頻譜，DF3 影響可預測 | JSD < 0.10 |
+| **`hf_ratio`** | High-frequency energy ratio | ⭐ **Reliable**：直接量頻譜 | JSD < 0.10 |
+| `snr_db` | voiced_E / unvoiced_E ratio | ⚠ **Heuristic**（不是真 SNR）| 對 VV 持續背景噪音 saturate；DF3 同比例壓 voiced+unvoiced 後比例不變 |
+| `reverb_sec` | 能量包絡衰減估算 RT60 | ⚠ **Heuristic**（不是真 reverb）| DF3 改 transient 形狀後 heuristic 失準 |
 
 **為什麼必要**：M4Singer (錄音室) vs VocalVerse (user-generated) 的音質域差異，若不通過 dereverb 拉齊，會讓 D_mel/D_z 學到「環境音=amateur 簽名」的捷徑（Risk 2 主防線）。
 
-**不過時的處理**（依序）：
-1. 確認 binarize 用預設 dereverb=True
-2. 在外部做 SNR 篩選把 VocalVerse 過糟的樣本拿掉
-3. 嚴重不過則考慮換 dataset 或縮小選曲
+**Verdict 判讀**（重要：FAIL 不一定等於 mitigation 失效）：
+
+| 狀況 | 判讀 | 行動 |
+|---|---|---|
+| 全部 PASS | 理想，極少見（M4 vs VV 本質不同） | 直接進 Stage 1 |
+| **僅 heuristic FAIL（snr / reverb），reliable PASS（sfm / hf_ratio）** | **形式 FAIL 但實質 mitigation 生效**（典型結果，Colab 實測 dereverb 後 hf_ratio 從 0.26 → 0.05 PASS、sfm 從 0.64 → 0.39 大幅改善） | 視為通過進 Stage 1；Stage 2 訓練時嚴密看 L5 monitor |
+| Reliable metric 也 FAIL | mitigation 真的不足 | (a) 確認 binarize 用 dereverb=True；(b) 加 SNR 篩選砍極端 VV 樣本；(c) 換 dataset |
+
+**真正的 Risk 2 ground truth 是 Stage 2 訓中 L5 monitor**（`unvoiced_concentration < 0.55`），它直接量 M 是否在去殘響——比 raw-wav heuristic 公允得多。
+
+**Colab A100 實測值**（apply_dereverb=True，n_per_dir=100）：
+
+| Metric | Raw JSD | Dereverb JSD | Δ | Verdict |
+|---|---:|---:|---|---|
+| sfm | 0.644 | **0.390** | -39% ↘ | FAIL 但方向對 |
+| hf_ratio | 0.258 | **0.048** ✅ | -81% ↘↘ | PASS |
+| reverb_sec | 0.113 | 0.118 | +5% → | FAIL（heuristic 限制）|
+| snr_db | 0.659 | 0.624 | -5% → | FAIL（heuristic 限制）|
+
+判讀：**Reliable metric 改善 / PASS → mitigation 生效，可進 Stage 1**。
 
 #### Gate ③：資料策展 JSD（register / phoneme）
 

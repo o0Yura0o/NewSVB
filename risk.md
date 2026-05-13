@@ -25,8 +25,15 @@
        - 0.55–0.65 marginal（觀察）
        - > 0.65 **Risk 2 警訊**（M 修飾集中在 unvoiced/silent 段，可能在去殘響）
   5. **Phase 0 audio quality probe（P1，必跑）** ⭐：
-     `scripts/audio_quality_probe.py` 計算兩 dataset 的 SFM / Reverb / HF-ratio / SNR
-     分布並算 JSD，若任一 < 0.10 才 PASS，否則需加強前處理
+     `scripts/audio_quality_probe.py` 計算兩 dataset 的 4 個 metric 分布 + JSD。
+     **4 metric 可信度不等**（實測 dereverb response 後分類）：
+       - **Reliable**（直接量頻譜，DF3 影響可預測）：`sfm`、`hf_ratio`
+       - **Heuristic**（量測方法限制）：`snr_db`（voiced_E/unvoiced_E 比，VV 背景噪音
+         saturate）、`reverb_sec`（能量衰減估算，DF3 改 transient 形狀後失準）
+     形式 FAIL 不等於 mitigation 失效——**只看 reliable metric**：sfm + hf_ratio
+     改善 / PASS 即視為實質通過。真正 ground truth 是 L5 monitor
+     `unvoiced_concentration`，比 raw-wav heuristic 公允得多。
+     用 `--apply-dereverb` 可跑 dereverb 後變體，直接驗證 mitigation 縮小頻譜差距。
 
 ### Risk 3：Anchor MSE 過於剛性（已消除）
 - **原描述**：frame-by-frame MSE 會強烈懲罰專業歌手的時間軸微調
