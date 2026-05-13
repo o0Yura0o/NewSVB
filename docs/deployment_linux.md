@@ -6,6 +6,7 @@
 > - [rebuild_checklist.md](../rebuild_checklist.md) — 架構決策（為什麼這樣設計）
 > - [risk.md](../risk.md) — 風險清單與訓中監控指標
 > - [training_flow.md](training_flow.md) — 訓練 pipeline 細節（每階段 input/output shapes）
+> - [phase0_colab_workflow.md](phase0_colab_workflow.md) — **替代方案**：Phase 0 在 Colab 跑、Phase 1/2 才回訓練機，省訓練機 16-20h binarize 時間
 
 ---
 
