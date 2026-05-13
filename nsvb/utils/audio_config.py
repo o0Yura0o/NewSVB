@@ -145,3 +145,13 @@ RESEMBLYZER_EMBED_DIM = 256
 LATENT_SIZE = 128
 LATENT_DOWN_FACTOR = 4
 LATENT_FRAME_RATE_HZ = FRAME_RATE_HZ / LATENT_DOWN_FACTOR  # ~43.07 fps
+
+# ── 訓練 batch 內樣本長度上限 ──────────────────────────────
+# 為什麼 1500：
+#   - VocalVerse binarize 切 5s chunks（~860 frames）→ 1500 容納無需 random crop
+#   - M4Singer 5-sec snippets（~860 frames，少數 9s outlier ~1500 frames）→ 1500 涵蓋
+#   - latent T_z = 1500 / 4 = 375 ≥ PatchNCE num_patches=128 ✓
+#   - 對齊 NSVB 設計「每樣本作為完整 phrase 訓練單位」哲學
+# 為什麼不更高（如 NSVB 原版 2400）：M4Singer 最長 8.8s ≈ 1500 frames，1500 已涵蓋
+#   所有 M4 snippets；用 2400 多 60% VRAM/算力卻無實質訊息增加
+DEFAULT_MAX_FRAMES = 1500

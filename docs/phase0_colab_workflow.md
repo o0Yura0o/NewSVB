@@ -417,7 +417,7 @@ print(r.get('verdict', r))
 # 目標：~20896；中途看到逐漸接近即為健康
 ```
 
-### 6.2 跑 VocalVerse（含 amateur_score 過濾，~6-10h）
+### 6.2 跑 VocalVerse（含 amateur_score 過濾 + chunk 切片，~6-10h）
 
 ```python
 !PYTHONPATH=. python -m nsvb.data.binarizer \
@@ -425,16 +425,23 @@ print(r.get('verdict', r))
     --data-root data \
     --out-root data/binarized \
     --vocalverse-amateur-score-max 3.0 \
+    --vocalverse-chunk-sec 5.0 \
     2>&1 | tee data/binarized/vv_log.txt
 ```
 
-> 用 `amateur_score ≤ 3.0` 預設，留 536 筆。詳見 [training_flow.md §1.1.1](training_flow.md)。
+兩個關鍵旗標：
+- `--vocalverse-amateur-score-max 3.0`：依 (技巧+氣息)/2 ≤ 3 過濾，留 **536 筆**真業餘
+- `--vocalverse-chunk-sec 5.0`：每首歌切成 5-sec chunks，解決與 M4Singer 平均 5.4s snippets 的長度失衡
+
+> **為什麼要 chunk**：VV 平均 200s × 536 首 vs M4 5.4s × 21K 個 → 樣本數 1:39。chunk 後 VV ≈ 536 × 40 = **21,440 chunks**，與 M4 21K 平衡。對齊 NSVB 設計「每樣本=一個 phrase 訓練單位」哲學。詳見 [training_flow.md §1.1.2](training_flow.md)。
 
 進度檢查：
 
 ```python
 !ls /content/drive/MyDrive/NSVB-ZH/data/binarized/vocalverse/ | wc -l
-# 目標：~536
+# 目標：~21000-21500 個 .npz（536 songs × ~40 chunks/song）
+# 檔名格式：{歌曲id}__{录音id}__c{NNN}.npz
+!ls /content/drive/MyDrive/NSVB-ZH/data/binarized/vocalverse/ | head -3
 ```
 
 ### 6.3 PPG k-means → phoneme_id（30-60 分鐘）
@@ -624,7 +631,7 @@ git rev-parse HEAD  # 確認與 COMMIT_HASH.txt 一致
 
 ```bash
 ls data/binarized/m4singer/*.npz | wc -l           # 預期 ~20896
-ls data/binarized/vocalverse/*.npz | wc -l         # 預期 ~536（若 amateur_score≤3.0）
+ls data/binarized/vocalverse/*.npz | wc -l         # 預期 ~21000+（536 songs × ~40 chunks）
 ls -lh data/binarized/ppg_kmeans_centroids.npy     # 必須存在
 du -sh data/binarized                              # ~100 GB
 ```

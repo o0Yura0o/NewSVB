@@ -254,8 +254,15 @@ python -m nsvb.data.binarizer \
     --dataset vocalverse \
     --data-root data \
     --out-root data/binarized \
-    --vocalverse-amateur-score-max 3.0
+    --vocalverse-amateur-score-max 3.0 \
+    --vocalverse-chunk-sec 5.0
 ```
+
+兩個旗標的作用：
+- `--vocalverse-amateur-score-max 3.0`：依 (技巧+氣息)/2 ≤ 3 過濾，留 536 首真業餘
+- `--vocalverse-chunk-sec 5.0`：每首 200s 切成 ~40 個 5s chunks，解決與 M4Singer 平均 5.4s snippets 的長度失衡（最終約 21K VV chunks，與 M4 21K 對等）
+
+詳細推理（為什麼要 chunk）見 [training_flow.md §1.1.2](training_flow.md)。
 
 #### VocalVerse 多維過濾 ⭐ 推薦
 
@@ -375,7 +382,7 @@ python -m scripts.cluster_ppg_inspect \
 cat outputs/phase0_vocoder/report.json | grep verdict
 cat outputs/phase0_audio_quality/report.json | grep verdict
 ls data/binarized/m4singer/*.npz | wc -l   # 應接近 700+
-ls data/binarized/vocalverse/*.npz | wc -l # 應接近 7000+
+ls data/binarized/vocalverse/*.npz | wc -l # 應接近 21000+（536 songs × ~40 chunks each）
 ```
 
 ---

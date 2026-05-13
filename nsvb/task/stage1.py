@@ -99,7 +99,9 @@ class Stage1Config:
     # ── 資料 ──
     binarized_root: str = "data/binarized"
     datasets: tuple = ("m4singer", "vocalverse")
-    max_frames: int = 600
+    # 為什麼 1500：VocalVerse 5s chunks ≈ 860 frames + M4Singer 9s outlier ≈ 1500
+    # 涵蓋兩 dataset 所有樣本不觸發 random crop（隨 binarize 端 chunk VV 同步調整）
+    max_frames: int = 1500
     batch_size: int = 16
     num_workers: int = 4
 
@@ -378,7 +380,9 @@ def main():
                         help="whisper-large-v3=1280, smoke whisper-tiny=384")
     parser.add_argument("--max-steps", type=int, default=200000)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-frames", type=int, default=600)
+    parser.add_argument("--max-frames", type=int, default=1500,
+                        help="batch 內樣本長度上限（mel frames）。1500 ≈ 8.7s @ hop=128，"
+                             "對應 VV 切 5s chunks + M4 9s outlier 全涵蓋")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default=None, choices=[None, "cpu", "cuda"])
     parser.add_argument("--no-adv", action="store_true",

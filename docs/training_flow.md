@@ -15,7 +15,8 @@
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Phase 0  資料二進位化  (data/{m4singer,VocalVerse}/*.wav  →  .npz)          │
-│   binarizer.py (含 dereverb) + cluster_ppg.py                                │
+│   binarizer.py (含 dereverb + VV chunk 5s) + cluster_ppg.py                  │
+│   → M4 ~21K snippets + VV ~21K chunks (5s each), 樣本數 1:1 平衡             │
 │                                                                              │
 │ Phase 0 gate ① Vocoder identity test  SSIM ≥ 0.90, F0 RMSE ≤ 10 Hz           │
 │ Phase 0 gate ② Audio quality probe    SFM/Reverb/HF/SNR JSD < 0.10           │
@@ -145,6 +146,45 @@ python -m nsvb.data.vocalverse_mos --vocalverse-root data/VocalVerse
 
 > `--vocalverse-mos-threshold` 為舊 flag、deprecated 但仍相容；推薦改用
 > `--vocalverse-amateur-score-max` 走 pro 4-dim 主信號。
+
+#### 1.1.2 VocalVerse 切 chunk（推薦）⭐
+
+**為什麼必要**：VocalVerse 平均 200s × 536 首（過濾後）vs M4Singer 5.4s × 20,896 個 snippets → **樣本數 1:39 嚴重失衡**。若不切：
+
+| 問題 | 細節 |
+|---|---|
+| **Stage 1 dataset 嚴重 imbalance** | ConcatDataset 均勻抽樣 → VV 被抽到只 2.5%，CVAE 幾乎只看 M4 分布 |
+| **Stage 2 per-sample 過度訪問** | VV 536 sample → 每 sample 訪問 ~3500 次 vs M4 ~92 次，VV 端 overfitting 風險高 |
+| **IO 載入浪費** | VV .npz ~120 MB 每首，random crop 只用 ~5s ≈ **95% IO 浪費** |
+| **偏離 NSVB 設計 envelope** | NSVB 假設「每樣本=一個 phrase 訓練單位」，PopBuTFy 3-9s 切片完全符合；VV 200s 完全跳出 |
+
+**做法**：binarize 時加 `--vocalverse-chunk-sec 5.0`，每首 200s 切成 ~40 個 5s chunks。
+
+**chunk 邏輯**（[binarizer.chunk_sample](../nsvb/data/binarizer.py)）：
+- 固定 stride 5s 切（不做 silence-aware，簡單可預測）
+- 每 chunk 各自存 .npz，item_id 加 `__c{NNN}` 後綴
+- spk_emb（per-song）每 chunk 重複存一份 → 同首所有 chunks 維持同一歌手
+- 最後 < 3s 尾段丟棄（避免訓練不穩；損失 < 0.5% 資料）
+
+**結果對比**：
+
+| Dataset | 改動前 | chunk_sec=5 後 |
+|---|---:|---:|
+| M4Singer | 20,896 個 5-sec snippets | 20,896（不變） |
+| VocalVerse | 536 個 200-sec songs | **~21,440 個 5-sec chunks** |
+| 樣本數比 | 1:39 | **~1:1** ⭐ |
+| 每樣本 .npz 大小 | M4 ~3 MB / VV ~120 MB | 兩者皆 ~3 MB |
+| 訓練 IO 浪費 | VV 95% | **VV ~0%** |
+
+**對齊 max_frames=1500**（[audio_config.DEFAULT_MAX_FRAMES](../nsvb/utils/audio_config.py)）：5s chunk ~860 frames + M4 9s outlier ~1500 frames 都涵蓋；random crop 不再頻繁觸發，每樣本完整作為訓練單位。詳見 [§5.2 tensor shape](#52-訓練時-batch-內-tensor-形狀max_frames1500) 與 [§6.2 / §6.3 配方表](#62-stage-1cvae)。
+
+**指令**（與 §1.1.1 過濾組合使用）：
+
+```bash
+python -m nsvb.data.binarizer --dataset vocalverse \
+    --vocalverse-amateur-score-max 3.0 \
+    --vocalverse-chunk-sec 5.0
+```
 
 ### 1.2 抽取的特徵（per song → 一個 .npz）
 
@@ -819,7 +859,7 @@ vocoder(mel, f0_p_ref)  →  wav (T_p samples)
 
 ### 4.4 Padding 處理（FVAE stride 對齊）
 
-FVAE encoder/decoder 的 stride conv 要求 `T_mel % LATENT_DOWN_FACTOR == 0`。訓練時 `max_frames=600` 剛好是 4 倍數繞過；推理時 user 輸入長度任意，必須在 pipeline 內補齊：
+FVAE encoder/decoder 的 stride conv 要求 `T_mel % LATENT_DOWN_FACTOR == 0`。訓練時 `max_frames=1500` 剛好是 4 倍數繞過；推理時 user 輸入長度任意，必須在 pipeline 內補齊：
 
 ```python
 # pipeline._pad_batch_to_multiple(batch, factor=4)
@@ -885,11 +925,11 @@ models = load_inference_models(
 | mel | 172.27 | hop=128, 1 frame = 5.8 ms |
 | latent z | 43.07 | strides=4, 1 frame = 23.2 ms |
 
-### 5.2 訓練時 batch 內 tensor 形狀（max_frames=600）
+### 5.2 訓練時 batch 內 tensor 形狀（max_frames=1500）
 
 ```
-T_mel (max in batch)       例：600
-T_z   (= floor((T_mel-4)/4)+1)  例：150
+T_mel (max in batch)       例：1500   (~ 8.7 sec @ hop=128)
+T_z   (= floor((T_mel-4)/4)+1)  例：375   (= 1500/4)
 B (batch_size)             例：16
 
 # Mel rate 系列
@@ -938,7 +978,7 @@ gin_channels=256 (= ppg_proj 128 + pitch_emb 32 + spk_proj 96)
 hidden=192, latent=128, strides=[4], enc_layers=8, dec_layers=4, kernel=5
 loss weights: l1=1 l2=1 kl_target=0.01(warmup 5k) adv_mel=0.1
 optim: lr_g=2e-4 (init from NSVB → ×0.5 = 1e-4), lr_d=2e-4
-batch=16, max_frames=600, max_steps=80k (with NSVB init) ~ 200k (scratch)
+batch=16, max_frames=1500, max_steps=80k (with NSVB init) ~ 200k (scratch)
 ```
 
 ### 6.3 Stage 2（Mapping）
@@ -948,7 +988,7 @@ D_z:  hidden=256, num_layers=4, kernel=5, vocab=200, embed=32
 PatchNCE: proj=64, num_patches=128, temp=0.07
 loss weights: NCE=1.0, adv_z=1.0(after warmup 5k), adv_mel=0.2, id_pro=0.1@0.2_prob
 optim TTUR: lr_M=1e-4, lr_Dz=4e-4, lr_Dmel=1e-5  (β=(0.5, 0.999))
-batch=16, max_frames=600, max_steps=120k
+batch=16, max_frames=1500, max_steps=120k
 
 D_mel real source: pro-only (default) | pro+amateur if --dmel-mix-amateur-real
 

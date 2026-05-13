@@ -272,6 +272,83 @@ def save_sample(sample: dict, out_path: Path):
     np.savez_compressed(out_path, **sample)
 
 
+def chunk_sample(
+    sample: dict,
+    chunk_sec: float,
+    min_remaining_sec: float = 3.0,
+) -> List[dict]:
+    """
+    把整首歌的 feature dict 切成 N 個 chunk_sec 秒的 chunks。
+
+    為什麼需要切：
+      VocalVerse 每首約 200 秒，遠超 NSVB 訓練設計的 phrase 級單位（5-10s）。
+      若直接以整首為 sample：
+        - 訓練 dataset 每 epoch 看不完 200s 中的大部分內容（random crop 只取 ~5s）
+        - 載入單一 .npz 約 120 MB 但訓練只用到 ~5s ≈ 95% IO 浪費
+        - 整體 M4 21K samples vs VV 536 samples 1:39 比例失衡
+      切成 5-sec chunks 後 VV ≈ 21K，與 M4 平衡，與 NSVB「每樣本=phrase」哲學一致。
+
+    為什麼最後一個短 chunk 丟掉：
+      < min_remaining_sec 的 chunk 訓練時可能：
+        - 不足以涵蓋一個 phrase
+        - max_frames padding 過多影響 batch 統計
+        - 邊界 silence 比例太高
+      丟掉只損失最多 chunk_sec - 1 秒 / 首歌 ≈ 0.5% 資料，影響可忽略。
+
+    為什麼 spk_emb 重複放入每 chunk：
+      spk_emb 是每首歌共用的「歌手音色錨」（Resemblyzer 對整首歌算的 256-dim 向量），
+      切 chunk 後同首所有 chunks 仍是同一歌手；每 chunk 各自存一份 spk_emb 才能
+      獨立載入。重複的成本只 1 KB × N chunks，可忽略。
+
+    Args:
+        sample:            binarize_one 的輸出
+        chunk_sec:         每個 chunk 的目標長度（秒）
+        min_remaining_sec: 短於此值的尾段直接丟棄
+
+    Returns:
+        list of chunk dicts；每個含與 sample 相同 schema，但 wav / mel / f0 /
+        voicing / register_soft / register_id / ppg / phoneme_id 都被切片，
+        metadata 中 item_id 加 `__c{idx:03d}` 後綴。
+    """
+    chunk_frames = int(chunk_sec * SAMPLE_RATE / HOP_SIZE)   # ~860 for 5s
+    chunk_samples = int(chunk_sec * SAMPLE_RATE)              # ~110250 for 5s
+    min_frames = int(min_remaining_sec * SAMPLE_RATE / HOP_SIZE)
+
+    T_mel = sample["mel"].shape[0]
+    N_samples = sample["wav"].shape[0]
+    base_item_id = str(sample["meta_item_id"])
+
+    # frame-rate 同步的 keys（沿時間軸切）
+    framewise_keys = ["mel", "f0", "voicing", "register_soft", "register_id", "ppg"]
+    # wav 是 sample-rate（時間軸更密）
+    # spk_emb / metadata 不切（per-song scalar / vector）
+
+    chunks: List[dict] = []
+    for chunk_idx, start_f in enumerate(range(0, T_mel, chunk_frames)):
+        end_f = min(start_f + chunk_frames, T_mel)
+        if (end_f - start_f) < min_frames:
+            # 尾段過短，丟棄
+            break
+
+        start_s = start_f * HOP_SIZE
+        end_s = min(end_f * HOP_SIZE, N_samples)
+
+        chunk = {k: sample[k][start_f:end_f] for k in framewise_keys}
+        chunk["wav"] = sample["wav"][start_s:end_s]
+        # spk_emb 整首共用，每 chunk 都存一份相同的
+        chunk["spk_emb"] = sample["spk_emb"]
+        # metadata：保留歌手 / dataset 不變，但 item_id 加 chunk 後綴
+        chunk["meta_dataset"] = sample["meta_dataset"]
+        chunk["meta_speaker_id"] = sample["meta_speaker_id"]
+        chunk["meta_item_id"] = np.array(f"{base_item_id}__c{chunk_idx:03d}")
+        chunk["meta_sample_rate"] = sample["meta_sample_rate"]
+        chunk["meta_hop_size"] = sample["meta_hop_size"]
+        chunk["meta_dereverbed"] = sample["meta_dereverbed"]
+        chunks.append(chunk)
+
+    return chunks
+
+
 # ── 主流程 ──────────────────────────────────────────────
 def run_binarize(
     dataset_root: Path,
@@ -284,6 +361,7 @@ def run_binarize(
     dereverb: bool = True,
     vocalverse_filter: Optional[FilterCriteria] = None,
     vocalverse_label_dir: Optional[Path] = None,
+    vocalverse_chunk_sec: Optional[float] = None,
 ):
     """
     對一個 dataset 跑完整 binarize。
@@ -350,17 +428,40 @@ def run_binarize(
     n_done = n_skip = n_err = 0
     t_start = time.time()
 
-    for i, spec in enumerate(samples):
-        out_path = out_dir / f"{spec.item_id}.npz"
+    # 是否切 chunk（僅 VV 用）
+    do_chunk = (dataset_name == "vocalverse" and vocalverse_chunk_sec is not None)
+    if do_chunk:
+        print(f"[binarize] VocalVerse chunking ON: each song → {vocalverse_chunk_sec}s chunks",
+              flush=True)
 
-        if skip_existing and out_path.exists():
+    for i, spec in enumerate(samples):
+        # 為什麼用 __c000.npz 當「整首已處理過」的代表：
+        #   chunk 順序寫，c000 存在表示 binarize_one 跑成功且 chunking 啟動過；
+        #   檢查所有 chunks 太貴（chunk 數依歌長變），c000 已是充分指標
+        if do_chunk:
+            probe_path = out_dir / f"{spec.item_id}__c000.npz"
+        else:
+            probe_path = out_dir / f"{spec.item_id}.npz"
+
+        if skip_existing and probe_path.exists():
             n_skip += 1
             continue
 
         try:
             sample = binarize_one(spec, extractors, dereverb=dereverb)
-            save_sample(sample, out_path)
-            n_done += 1
+            if do_chunk:
+                chunks = chunk_sample(sample, vocalverse_chunk_sec)
+                if not chunks:
+                    print(f"[binarize] {spec.item_id}: song too short for any chunk, skipping")
+                    n_err += 1
+                    continue
+                for ch_idx, ch in enumerate(chunks):
+                    ch_path = out_dir / f"{spec.item_id}__c{ch_idx:03d}.npz"
+                    save_sample(ch, ch_path)
+                n_done += 1
+            else:
+                save_sample(sample, probe_path)
+                n_done += 1
         except Exception as e:
             print(f"[binarize] ERROR on {spec.item_id}: {e}")
             n_err += 1
@@ -457,6 +558,13 @@ def main():
         help="VocalVerse label 目錄路徑覆寫。預設自動找 "
              "{vocalverse_root}/VocalVerse_Datasets-human_labels/",
     )
+    parser.add_argument(
+        "--vocalverse-chunk-sec", type=float, default=None,
+        help="（僅 --dataset vocalverse）⭐ 把每首歌切成 N 個 chunk_sec 秒 chunks，"
+             "解決 VV 長 recording vs M4 短 snippet 的失衡（M4 21K snippets vs "
+             "VV 536 songs ≈ 39:1）。推薦 5.0（VV 切完 ≈ 21K chunks 與 M4 對等）。"
+             "None=不切（VV 保持整首 200s 一個 .npz；訓練 random crop 會浪費 IO）",
+    )
     # 向後相容：舊參數名 → 對應到 mos-max
     parser.add_argument(
         "--vocalverse-mos-threshold", type=float, default=None,
@@ -505,6 +613,7 @@ def main():
         dereverb=not args.no_dereverb,
         vocalverse_filter=vocalverse_filter,
         vocalverse_label_dir=Path(args.vocalverse_label_dir) if args.vocalverse_label_dir else None,
+        vocalverse_chunk_sec=args.vocalverse_chunk_sec,
     )
 
 
