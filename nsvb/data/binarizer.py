@@ -362,6 +362,7 @@ def run_binarize(
     vocalverse_filter: Optional[FilterCriteria] = None,
     vocalverse_label_dir: Optional[Path] = None,
     vocalverse_chunk_sec: Optional[float] = None,
+    skip_check_extra_dir: Optional[Path] = None,
 ):
     """
     對一個 dataset 跑完整 binarize。
@@ -434,18 +435,37 @@ def run_binarize(
         print(f"[binarize] VocalVerse chunking ON: each song → {vocalverse_chunk_sec}s chunks",
               flush=True)
 
+    # 額外 skip 檢查目錄（Colab 本地寫 + Drive sync 場景用）
+    # 為什麼分開：
+    #   寫入指向 fast disk（/content/local_binarized）；
+    #   skip_existing 想看 slow disk（Drive，已 sync 過的歷史 .npz）;
+    #   不分開的話 session 重連必須先把 Drive rsync 回 local 才能 skip，浪費時間
+    extra_check_dataset_dir: Optional[Path] = None
+    if skip_check_extra_dir is not None:
+        extra_check_dataset_dir = skip_check_extra_dir / dataset_name
+        print(f"[binarize] skip_existing additionally checks: {extra_check_dataset_dir}",
+              flush=True)
+
     for i, spec in enumerate(samples):
         # 為什麼用 __c000.npz 當「整首已處理過」的代表：
         #   chunk 順序寫，c000 存在表示 binarize_one 跑成功且 chunking 啟動過；
         #   檢查所有 chunks 太貴（chunk 數依歌長變），c000 已是充分指標
         if do_chunk:
-            probe_path = out_dir / f"{spec.item_id}__c000.npz"
+            probe_name = f"{spec.item_id}__c000.npz"
         else:
-            probe_path = out_dir / f"{spec.item_id}.npz"
+            probe_name = f"{spec.item_id}.npz"
+        probe_path = out_dir / probe_name
 
-        if skip_existing and probe_path.exists():
-            n_skip += 1
-            continue
+        if skip_existing:
+            if probe_path.exists():
+                n_skip += 1
+                continue
+            # 雙目錄檢查：Drive 上已有的也跳過
+            if extra_check_dataset_dir is not None:
+                extra_probe = extra_check_dataset_dir / probe_name
+                if extra_probe.exists():
+                    n_skip += 1
+                    continue
 
         try:
             sample = binarize_one(spec, extractors, dereverb=dereverb)
@@ -565,6 +585,15 @@ def main():
              "VV 536 songs ≈ 39:1）。推薦 5.0（VV 切完 ≈ 21K chunks 與 M4 對等）。"
              "None=不切（VV 保持整首 200s 一個 .npz；訓練 random crop 會浪費 IO）",
     )
+    parser.add_argument(
+        "--skip-check-extra-dir", default=None,
+        help="額外的 skip_existing 檢查目錄（除了 --out-root 之外再多檢查一處）。"
+             "用於 Colab 本地寫 + Drive sync 場景：--out-root /content/local_binarized "
+             "（快），同時 --skip-check-extra-dir /content/drive/.../data/binarized "
+             "→ binarize 跳過 Drive 上已有的 .npz（前次 session sync 過的歷史進度），"
+             "避免 session 重連時要先 rsync Drive→local。"
+             "格式與 --out-root 同（會自動加 {dataset_name}/ 子目錄）",
+    )
     # 向後相容：舊參數名 → 對應到 mos-max
     parser.add_argument(
         "--vocalverse-mos-threshold", type=float, default=None,
@@ -614,6 +643,7 @@ def main():
         vocalverse_filter=vocalverse_filter,
         vocalverse_label_dir=Path(args.vocalverse_label_dir) if args.vocalverse_label_dir else None,
         vocalverse_chunk_sec=args.vocalverse_chunk_sec,
+        skip_check_extra_dir=Path(args.skip_check_extra_dir) if args.skip_check_extra_dir else None,
     )
 
 

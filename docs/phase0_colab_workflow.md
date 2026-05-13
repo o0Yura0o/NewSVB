@@ -439,38 +439,98 @@ for name in ['phase0_audio_quality_raw', 'phase0_audio_quality_dereverbed']:
 
 ---
 
-## 6. Phase 0 Binarize（12-18 小時，**可中斷續跑**）
+## 6. Phase 0 Binarize（~5-7 小時 with local-write + sync，**可中斷續跑**）
 
-### 6.1 開大 cell 跑 M4Singer
+⭐ **Colab IO 優化**：寫到 Drive 直接會被 FUSE overhead 拖到 12-18h；改寫**本地 SSD `/content/local_binarized/`**（100-300 MB/s）+ **背景 rsync 每分鐘同步到 Drive**，總時間降到 **~5-7h**，省 ~5-9h。
+
+### 6.0 啟動 local-write + background sync pattern（**必跑，§6.1–6.3 共用**）
+
+跑 binarize **之前**先設定好本地目錄與背景同步。這個 cell 跑一次，sync thread 會持續到 §6.4 顯式停止（或 runtime restart）：
+
+```python
+import os, time, subprocess, threading
+
+# 本地暫存（Pro+ A100 runtime 有 ~200 GB /content 空間，足夠 ~110 GB 全部 binarized）
+LOCAL_OUT = '/content/local_binarized'
+DRIVE_OUT = '/content/drive/MyDrive/NSVB-ZH/data/binarized'
+os.makedirs(LOCAL_OUT, exist_ok=True)
+os.makedirs(DRIVE_OUT, exist_ok=True)
+
+# 把 data/binarized symlink 改指到 local（覆蓋 §3.5 的 Drive 指向）
+%cd /content/NSVB-ZH
+!rm -f data/binarized
+!ln -sfn /content/local_binarized data/binarized
+!ls -la data/binarized
+
+# 背景 rsync：每 60 秒一次 local → Drive
+_sync_stop = threading.Event()
+
+def sync_loop():
+    while not _sync_stop.is_set():
+        subprocess.run(
+            ['rsync', '-au', f'{LOCAL_OUT}/', f'{DRIVE_OUT}/'],
+            capture_output=True,
+        )
+        # print 進度（本地 vs Drive 累計檔案數）
+        try:
+            local_count = subprocess.check_output(
+                f'find {LOCAL_OUT} -name "*.npz" | wc -l', shell=True,
+            ).decode().strip()
+            drive_count = subprocess.check_output(
+                f'find {DRIVE_OUT} -name "*.npz" | wc -l', shell=True,
+            ).decode().strip()
+            print(f"[sync {time.strftime('%H:%M:%S')}] "
+                  f"local={local_count}  drive={drive_count}", flush=True)
+        except Exception as e:
+            print(f"[sync] count failed: {e}", flush=True)
+        if _sync_stop.wait(timeout=60):
+            break
+
+sync_thread = threading.Thread(target=sync_loop, daemon=True)
+sync_thread.start()
+print('✅ Background sync started (local → Drive, every 60s)')
+```
+
+### 6.1 跑 M4Singer
+
+兩個關鍵旗標必加：
+- `--out-root /content/local_binarized`：寫 fast SSD（不寫 Drive）
+- `--skip-check-extra-dir /content/drive/...binarized`：session 重連時看 Drive 上已 sync 的也跳過，**不需 pre-populate**
 
 ```python
 %cd /content/NSVB-ZH
-# M4Singer 21K snippets，~6-10h on A100
+# M4Singer 21K snippets，~3-5h on A100 with local-write
 !PYTHONPATH=. python -m nsvb.data.binarizer \
     --dataset m4singer \
     --data-root data \
-    --out-root data/binarized 2>&1 | tee data/binarized/m4_log.txt
+    --out-root /content/local_binarized \
+    --skip-check-extra-dir /content/drive/MyDrive/NSVB-ZH/data/binarized \
+    2>&1 | tee /content/local_binarized/m4_log.txt
 ```
 
-**Session timeout 後**：重連 Colab → 重跑 §3.2 / §3.3 / §3.4 / §3.5（mount + git + pip + symlink）→ 直接重跑這個 cell。`skip_existing` 預設開，會跳過已存的 .npz。
+**Session timeout 後**：重連 → §3.2 / §3.3 / §3.4 / §3.5 → §6.0（重啟 sync thread）→ 直接重跑這個 cell。`--skip-check-extra-dir` 會看 Drive 已 sync 的 .npz 並跳過，**不用 rsync Drive→local**（省 ~30-60 min 重連時間）。
 
-進度檢查（另開 cell）：
+進度檢查（另開 cell；§6.0 sync 也會每 60s 自動 print）：
 
 ```python
-!ls /content/drive/MyDrive/NSVB-ZH/data/binarized/m4singer/ | wc -l
-# 目標：~20896；中途看到逐漸接近即為健康
+import subprocess
+local = subprocess.check_output('find /content/local_binarized/m4singer -name "*.npz" 2>/dev/null | wc -l', shell=True).decode().strip()
+drive = subprocess.check_output('find /content/drive/MyDrive/NSVB-ZH/data/binarized/m4singer -name "*.npz" 2>/dev/null | wc -l', shell=True).decode().strip()
+print(f'local: {local} / 20896  |  drive: {drive} / 20896')
+# 目標：local 接近 20896；drive 落後本地最多 60s（一輪 sync 週期）
 ```
 
-### 6.2 跑 VocalVerse（含 amateur_score 過濾 + chunk 切片，~6-10h）
+### 6.2 跑 VocalVerse（含 amateur_score 過濾 + chunk 切片，~2-3h）
 
 ```python
 !PYTHONPATH=. python -m nsvb.data.binarizer \
     --dataset vocalverse \
     --data-root data \
-    --out-root data/binarized \
+    --out-root /content/local_binarized \
+    --skip-check-extra-dir /content/drive/MyDrive/NSVB-ZH/data/binarized \
     --vocalverse-amateur-score-max 3.0 \
     --vocalverse-chunk-sec 5.0 \
-    2>&1 | tee data/binarized/vv_log.txt
+    2>&1 | tee /content/local_binarized/vv_log.txt
 ```
 
 兩個關鍵旗標：
@@ -490,15 +550,44 @@ for name in ['phase0_audio_quality_raw', 'phase0_audio_quality_dereverbed']:
 
 ### 6.3 PPG k-means → phoneme_id（30-60 分鐘）
 
+cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key），背景 sync 會自動偵測 mtime 更新並把 ~42K .npz 重新 sync 到 Drive。
+
 ```python
 !PYTHONPATH=. python -m nsvb.data.cluster_ppg \
-    --binarized-root data/binarized \
-    --centroids-out data/binarized/ppg_kmeans_centroids.npy \
+    --binarized-root /content/local_binarized \
+    --centroids-out /content/local_binarized/ppg_kmeans_centroids.npy \
     --k 200 \
     --stage all
 ```
 
-完成後，每個 .npz 多了 `phoneme_id` key，`data/binarized/` 多了 `ppg_kmeans_centroids.npy`。
+> **注意**：phoneme_id 加進去後 Drive 上的 ~42K .npz 全部要重 sync 一輪（~10-30 min；rsync `-u` 偵測 mtime）。耐心等 §6.4 final sync 確認都同步完。
+
+### 6.4 ⚠ 全部跑完後，**停 sync + 強制最後一次 rsync**
+
+```python
+print('Stopping background sync...')
+_sync_stop.set()
+sync_thread.join(timeout=10)
+
+print('Final rsync local → Drive (this catches any pending writes)...')
+result = subprocess.run(
+    ['rsync', '-au', '--info=stats2',
+     '/content/local_binarized/',
+     '/content/drive/MyDrive/NSVB-ZH/data/binarized/'],
+    capture_output=True, text=True,
+)
+print(result.stdout)
+
+# 驗證 final counts
+for ds in ['m4singer', 'vocalverse']:
+    n = subprocess.check_output(
+        f'find /content/drive/MyDrive/NSVB-ZH/data/binarized/{ds} -name "*.npz" | wc -l',
+        shell=True,
+    ).decode().strip()
+    print(f'  {ds}: {n} .npz on Drive')
+# 預期：m4singer ~20896, vocalverse ~21000+
+print('✅ Done. Drive is now in sync with local.')
+```
 
 ---
 
