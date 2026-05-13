@@ -334,7 +334,11 @@ print('DF3 ready')
 
 ---
 
-## 4. Phase 0 Gate ①：Vocoder identity test（5 分鐘）
+## 4. Phase 0 Gate ①：Vocoder identity test（~35 分鐘，兩跑）
+
+**為什麼比想像中久**：VocalVerse 是 200-秒 full-length 歌（M4Singer 才 5 秒 snippet），每首要全長跑 pyworld F0（~30-60s）+ torchcrepe F0 RMSE（~20-40s）+ vocoder forward（~10-15s）= ~90s/首。20 首 VocalVerse × 兩跑（raw + loud_norm）≈ 30 min，加 M4Singer ~5 min。整體 ~35 min。
+
+> 想加速可加 `--max-test-duration 30`（每首切前 30s 測，但目前腳本沒這個旗標；若需要可加 ~10 行補丁，VocalVerse 部分 90s → 15s，整體 ~8-10 min）
 
 **先跑這個再 binarize**——vocoder 過不了就不用浪費 16h binarize：
 
@@ -720,7 +724,7 @@ PYTHONPATH=. python -m nsvb.task.stage1 \
 | | §2.7 解壓 M4Singer | — | 10 min | 11 GB | 必要 |
 | | §2.8 上傳 vocoder ckpt | — | 2 min | 200 MB | 必要 |
 | **Stage B** | §3 環境 setup（重連也走這） | 5-10 min | — | — | 必要 |
-| | §4 Gate ① vocoder identity | 5 min | — | <100 MB | **dealbreaker** |
+| | §4 Gate ① vocoder identity（兩跑 raw + loud_norm） | ~35 min | — | <100 MB | **dealbreaker** |
 | | §5 Gate ② audio quality probe | 5 min | — | <10 MB | 必要 |
 | | §6.1 binarize M4Singer | 6-10 h | — | 46 GB | 必要 |
 | | §6.2 binarize VocalVerse | 6-10 h | — | 64 GB | 必要 |
@@ -730,4 +734,4 @@ PYTHONPATH=. python -m nsvb.task.stage1 \
 | | §9.2 壓縮 | 1 h | — | +85 GB | 可選 |
 | **傳輸** | §10 傳訓練機 | — | 0.5-3 h | (傳輸不增 Drive) | 必要 |
 | **訓練機** | §11 驗證 | — | 5 min | (sanity only) | 必要 |
-| **合計** | | **~16-20 h A100** | **~2-3 h CPU** | **~150 GB on Drive** | |
+| **合計** | | **~17-21 h A100** | **~2-3 h CPU** | **~150 GB on Drive** | |
