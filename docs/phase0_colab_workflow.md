@@ -378,20 +378,38 @@ for name in ['phase0_vocoder_raw', 'phase0_vocoder_loudnormed']:
 
 ## 5. Phase 0 Gate ②：Audio quality probe（5 分鐘）
 
+**跑兩次**（同 vocoder identity test 的策略）：
+
 ```python
+# Run A：raw wav — 量 Risk 2 緩解前的原始差距
 !PYTHONPATH=. python -m scripts.audio_quality_probe \
     --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
     --n-per-dir 100 \
-    --out-dir outputs/phase0_audio_quality
+    --out-dir outputs/phase0_audio_quality_raw
 
-# 看 verdict
+# Run B：dereverb'd wav — 量 binarize 端實際進訓練的 mel 分布
+!PYTHONPATH=. python -m scripts.audio_quality_probe \
+    --wav-dirs m4=data/m4singer vocalverse=data/VocalVerse \
+    --n-per-dir 100 \
+    --apply-dereverb \
+    --out-dir outputs/phase0_audio_quality_dereverbed
+
+# 看兩個 verdict
 import json
-with open('outputs/phase0_audio_quality/report.json') as f:
-    r = json.load(f)
-print(r.get('verdict', r))
+for name in ['phase0_audio_quality_raw', 'phase0_audio_quality_dereverbed']:
+    with open(f'outputs/{name}/audio_quality_report.json') as f:
+        r = json.load(f)
+    print(f"\n=== {name} ===")
+    print(f"verdict: {r.get('verdict')}")
+    for mk, jsd in r.get('jsds', {}).items():
+        flag = '✅' if jsd < 0.10 else '❌'
+        print(f"  {mk}: JSD={jsd:.4f}  {flag}")
 ```
 
-通過條件：所有 metric（SFM / Reverb / HF / SNR）的 JSD < 0.10。
+**通過條件**：
+- Run A（raw）預期會 FAIL — M4 studio mic vs VV 業餘 phone mic 本來就差很大，這個 FAIL 是「Risk 2 為什麼存在」的證據
+- **Run B（dereverb'd）應該 PASS 或大幅改善** — 驗證 binarize 端的 DF3 mitigation 確實縮小差距，這是真正進 Stage 1 之前的 gate
+- 若 Run B 仍 FAIL：Stage 2 訓練 L5 monitor（unvoiced_concentration）會抓到實際失敗，可即時用 `--dmel-mix-amateur-real` 救火
 
 ---
 
@@ -525,7 +543,8 @@ print("=== Phase 0 Gate Summary ===")
 for path in [
     'outputs/phase0_vocoder_raw/report.json',
     'outputs/phase0_vocoder_loudnormed/report.json',
-    'outputs/phase0_audio_quality/report.json',
+    'outputs/phase0_audio_quality_raw/audio_quality_report.json',
+    'outputs/phase0_audio_quality_dereverbed/audio_quality_report.json',
     'outputs/phase0_cluster_inspect/report.json',
 ]:
     try:

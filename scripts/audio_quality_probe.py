@@ -160,9 +160,16 @@ def compute_dataset_metrics(
     root: Path,
     n: int,
     seed: int = 42,
+    apply_dereverb: bool = False,
 ) -> Dict[str, List[float]]:
     """
     從 root 遞迴抽 n 個 wav，對每個算 4 個 metric，回傳 dict of lists。
+
+    Args:
+        apply_dereverb:
+            False (default) — 用 raw wav 算 metric，量「Risk 2 緩解之前的原始差距」
+            True            — 跑 DeepFilterNet3 dereverb 後算 metric，量「binarize 端
+                              實際進訓練的 wav 分布」，驗證 L2 mitigation 是否生效
     """
     candidates = sorted(root.rglob("*.wav"))
     if not candidates:
@@ -171,6 +178,10 @@ def compute_dataset_metrics(
     n = min(n, len(candidates))
     idx = rng.choice(len(candidates), size=n, replace=False)
 
+    # Lazy import DF3 only if needed（避免無 dereverb 跑也要付 3-5 sec 載入成本）
+    if apply_dereverb:
+        from nsvb.utils.audio_io import dereverb_wav
+
     metrics: Dict[str, List[float]] = {
         "sfm": [], "reverb_sec": [], "hf_ratio": [], "snr_db": [],
     }
@@ -178,6 +189,8 @@ def compute_dataset_metrics(
         path = candidates[k]
         try:
             wav, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
+            if apply_dereverb:
+                wav = dereverb_wav(wav)
             metrics["sfm"].append(spectral_flatness_mean(wav))
             metrics["reverb_sec"].append(reverb_estimate(wav))
             metrics["hf_ratio"].append(high_freq_energy_ratio(wav))
@@ -241,6 +254,12 @@ def main():
     parser.add_argument(
         "--seed", type=int, default=42,
     )
+    parser.add_argument(
+        "--apply-dereverb", action="store_true",
+        help="算 metric 前先跑 DeepFilterNet3 dereverb。"
+             "預設 False 量「raw 原始差距」；設 True 量「binarize 端實際進訓練的 mel 分布」，"
+             "驗證 Risk 2 L2 mitigation 是否縮小跨 dataset 差距",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -268,6 +287,7 @@ def main():
             continue
         per_dataset_metrics[name] = compute_dataset_metrics(
             root, n=args.n_per_dir, seed=args.seed,
+            apply_dereverb=args.apply_dereverb,
         )
 
     if len(per_dataset_metrics) < 2:
@@ -303,6 +323,12 @@ def main():
     v = verdict(metric_jsds)
     summary["verdict"] = v
     summary["jsd_threshold"] = JSD_PASS_THRESHOLD
+    # 紀錄此次跑的設定，方便對比不同設定的結果
+    summary["args"] = {
+        "n_per_dir": args.n_per_dir,
+        "seed": args.seed,
+        "apply_dereverb": args.apply_dereverb,
+    }
 
     # 報告
     report_path = out_dir / "audio_quality_report.json"
