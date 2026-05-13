@@ -1,7 +1,9 @@
 # 資料與模型（體積太大，不納入版本控制）
-data/
-checkpoints/
-runs/
+# ⚠ 開頭斜線 / 必要：否則會匹配任何深度的同名目錄
+# （例：未加 / 時 nsvb/data/ 整包原始碼會被誤擋）
+/data/
+/checkpoints/
+/runs/
 
 # Python
 __pycache__/
@@ -39,4 +41,4 @@ build/
 .claude/
 NSVB-ZH_ver1/
 tmp_reference.md
-outputs/
+/outputs/
