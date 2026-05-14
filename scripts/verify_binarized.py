@@ -45,6 +45,9 @@ from pathlib import Path
 
 import numpy as np
 
+# 讓 `python scripts/verify_binarized.py` 不論從哪個 cwd 跑都能 import nsvb。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # F0 上限（與 nsvb/utils/audio_config.F0_FMAX 對齊；import 失敗時 fallback）
 try:
     from nsvb.utils.audio_config import F0_FMAX

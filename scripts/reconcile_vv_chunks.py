@@ -39,16 +39,54 @@ verify_binarized.py 逐檔檢查「每個 .npz 本身健不健康」抓不到這
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import soundfile as sf
 
+# 讓 `python scripts/reconcile_vv_chunks.py` 不論從哪個 cwd 跑都能 import nsvb：
+# 直接跑 script 時 sys.path[0] 是 scripts/，repo root 不在 path 上。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from nsvb.utils.audio_config import SAMPLE_RATE, HOP_SIZE
-from nsvb.data.binarizer import list_vocalverse
 from nsvb.data.vocalverse_mos import (
     FilterCriteria, find_label_dir, load_vocalverse_labels,
     filter_samples, format_filter_stats,
 )
+
+
+# ── list_vocalverse 內聯版 ──────────────────────────────
+# 為什麼不從 nsvb.data.binarizer import：binarizer.py 在 module 層就載入
+# torch / Whisper / DeepFilterNet / Resemblyzer / torchcrepe 整套 GPU 抽取器，
+# reconcile 完全用不到，卻會因環境裡任一重依賴沒裝好而「import 就炸」。
+# list_vocalverse 本體只是「iterate 目錄 + glob wav」，內聯進來最穩。
+@dataclass
+class SampleSpec:
+    wav_path: str
+    speaker_id: str
+    item_id: str
+    dataset: str
+
+
+def list_vocalverse(root: Path) -> list:
+    """
+    VocalVerse 結構：{root}/{user_id}/{wav_id}.wav
+    item_id = "{user_id}__{wav_id}"（與 binarizer.list_vocalverse 完全一致，
+    reconcile 才能用 item_id 去 glob 對應的 __c*.npz）。
+    """
+    samples = []
+    for user_dir in sorted(root.iterdir()):
+        if not user_dir.is_dir():
+            continue
+        user_id = user_dir.name
+        for wav in sorted(user_dir.glob("*.wav")):
+            samples.append(SampleSpec(
+                wav_path=str(wav.resolve()),
+                speaker_id=user_id,
+                item_id=f"{user_id}__{wav.stem}",
+                dataset="vocalverse",
+            ))
+    return samples
 
 
 def estimate_t_mel(wav_path: str) -> int:
