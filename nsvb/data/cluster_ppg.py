@@ -40,10 +40,16 @@ Plan A' 中 D_z 的條件包含「Discrete Phoneme ID」（透過 nn.Embedding �
 - sklearn 實作對 d=1280 的 1M 樣本約 30-60 秒收斂
 
 【為什麼要先 sample 而非用全部 frames 訓練】
-- 全部 frames ~250M，連 MiniBatchKMeans 也太慢（隨機讀取磁碟 IO bottleneck）
-- 每首歌 sample 200 frames：~2M frames，8 GB fp32 in-memory，可全載
-- 抽樣不損失品質：phoneme cluster 的形狀由 millions of frames 決定，
-  從 250M 降到 2M 仍遠超 K=200 的需求（每 cluster 平均 ~10000 樣本）
+- 全部 frames 數億，連 MiniBatchKMeans 也太慢（隨機讀取磁碟 IO bottleneck）
+- 每個 .npz 抽 frames_per_song（預設 50）：本專案 ~42K 檔（M4Singer 20896 +
+  VocalVerse chunk 21458）約 ~2.1M frames、~10 GB fp32，np.concatenate 峰值
+  ~20 GB，Colab A100 可全載
+- ⚠ 記憶體 = 檔案數 × frames_per_song × 1280 × 4 byte，且 concatenate 峰值 2×。
+  VocalVerse 切 chunk 後檔案數比「整首」時代多 ~40×，frames_per_song 不能沿用
+  舊大值：曾用 200 → 42K 檔 × 200 = 8.5M frames → 峰值 ~86 GB → 撐爆 RAM OOM。
+  collect_ppg_samples 另有 max_total_frames 硬上限兜底
+- 抽樣不損失品質：phoneme cluster 形狀由數百萬 frames 決定，
+  ~2M 仍遠超 K=200 的需求（每 cluster 平均 ~10000 樣本）
 
 【兩階段 pipeline】
 - Stage A: 對所有 .npz 做 frame sampling，fit k-means → 存 centroids 到磁碟
@@ -72,10 +78,17 @@ from nsvb.utils.audio_config import WHISPER_HIDDEN_DIM
 # K：cluster 數量（見檔頭「為什麼 K=200」說明）
 DEFAULT_K = 200
 
-# 每首歌抽樣多少 frames 用於 fit k-means
-# 為什麼 200：~10000 首歌 × 200 = 2M frames，足以收斂；
-#            單首歌均勻抽避免長歌獨佔分布
-DEFAULT_FRAMES_PER_SONG = 200
+# 每個 .npz 抽樣多少 frames 用於 fit k-means
+# 為什麼 50（不是 200）：記憶體 = 檔案數 × frames_per_song × 1280 × 4 byte，
+#   且 np.concatenate 峰值 2×。本專案 ~42K 檔（含 VocalVerse chunk）下：
+#     50  → ~2.1M frames，concatenate 峰值 ~20 GB（安全）
+#     200 → ~8.5M frames，峰值 ~86 GB（撐爆 Colab A100 ~83 GB RAM → OOM）
+#   ~2M frames 對 K=200 早已遠超收斂需求（每 cluster 平均 ~10000 樣本）
+DEFAULT_FRAMES_PER_SONG = 50
+
+# collect_ppg_samples 的硬上限：即使 檔案數 × frames_per_song 失控也不 OOM。
+# 4M frames → array ~20 GB、concatenate 峰值 ~41 GB，Colab A100（~83 GB）安全
+DEFAULT_MAX_TOTAL_FRAMES = 4_000_000
 
 # MiniBatchKMeans 的 batch size
 # 為什麼 8192：sklearn 預設 1024，但 d=1280 高維下 batch 大一點 reassignment 較穩定；
@@ -100,6 +113,7 @@ def collect_ppg_samples(
     npz_paths: List[Path],
     frames_per_song: int = DEFAULT_FRAMES_PER_SONG,
     seed: int = RANDOM_STATE,
+    max_total_frames: int = DEFAULT_MAX_TOTAL_FRAMES,
 ) -> np.ndarray:
     """
     從每個 .npz 隨機抽 `frames_per_song` 個 PPG frames（避開首尾各 5 frame
@@ -112,9 +126,16 @@ def collect_ppg_samples(
     為什麼 fp32 in-memory：
       .npz 存 fp16 是為了磁碟空間，但 k-means 計算用 fp32 數值精度更穩；
       sklearn 對 fp16 也支援但 internal 仍轉 fp32。
+
+    為什麼有 max_total_frames 硬上限：
+      最後 np.concatenate 需要「pieces list + 輸出 array」同時在記憶體 → 峰值 2×。
+      若 檔案數 × frames_per_song 失控（VocalVerse 切 chunk 後檔案數 ~42K），
+      峰值會撐爆 Colab RAM 被 OOM kill。收集到上限就停 —— k-means fit 對 K=200
+      而言 ~2-4M frames 早已遠超需求，再多只是浪費記憶體。
     """
     rng = np.random.default_rng(seed)
     pieces = []
+    total = 0  # running counter（取代每 100 檔 O(n) 重算 sum，避免 O(n²)）
 
     for i, p in enumerate(npz_paths):
         try:
@@ -136,14 +157,23 @@ def collect_ppg_samples(
         n = min(frames_per_song, len(valid))
         idx = rng.choice(valid, size=n, replace=False)
         pieces.append(ppg[idx].astype(np.float32))
+        total += n
 
         if (i + 1) % 100 == 0:
             print(f"  collected {i+1}/{len(npz_paths)} songs, "
-                  f"running total = {sum(pc.shape[0] for pc in pieces)} frames")
+                  f"running total = {total} frames")
+
+        if total >= max_total_frames:
+            print(f"  reached max_total_frames={max_total_frames} at "
+                  f"{i+1}/{len(npz_paths)} 檔 — 停止收集"
+                  f"（已遠超 K-means fit 所需，避免 concatenate 峰值 OOM）")
+            break
 
     if not pieces:
         raise RuntimeError("No PPG frames collected — check .npz files exist and have 'ppg' key")
 
+    peak_gb = 2 * total * WHISPER_HIDDEN_DIM * 4 / 1e9
+    print(f"Collected {total} frames; np.concatenate 峰值記憶體 ~{peak_gb:.1f} GB")
     samples = np.concatenate(pieces, axis=0)
     print(f"Total samples for k-means: {samples.shape}")
     return samples
@@ -273,7 +303,15 @@ def main():
         "--frames-per-song",
         type=int,
         default=DEFAULT_FRAMES_PER_SONG,
-        help="Stage A 每首歌抽多少 frames",
+        help=f"Stage A 每個 .npz 抽多少 frames（預設 {DEFAULT_FRAMES_PER_SONG}）。"
+             "記憶體 = 檔案數 × 此值 × 1280 × 4 byte，concatenate 峰值 2×",
+    )
+    parser.add_argument(
+        "--max-total-frames",
+        type=int,
+        default=DEFAULT_MAX_TOTAL_FRAMES,
+        help=f"Stage A 收集 frames 的硬上限（預設 {DEFAULT_MAX_TOTAL_FRAMES}）；"
+             "防 檔案數 × frames-per-song 失控時 np.concatenate 峰值 OOM",
     )
     parser.add_argument(
         "--stage",
@@ -302,7 +340,11 @@ def main():
 
     # ── Stage A: fit ──
     if args.stage in ("fit", "all"):
-        samples = collect_ppg_samples(npz_paths, frames_per_song=args.frames_per_song)
+        samples = collect_ppg_samples(
+            npz_paths,
+            frames_per_song=args.frames_per_song,
+            max_total_frames=args.max_total_frames,
+        )
         km = fit_kmeans(samples, k=args.k)
         np.save(centroids_path, km.cluster_centers_.astype(np.float32))
         print(f"Saved centroids to {centroids_path} shape={km.cluster_centers_.shape}")
