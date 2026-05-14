@@ -717,23 +717,29 @@ import numpy as np
 from pathlib import Path
 from nsvb.utils.jsd_check import jensen_shannon_divergence, frame_freq_distribution
 
+# ⚠ 用「絕對路徑」指 binarized；不要靠 data/binarized symlink ——
+# §6.4 改過 symlink target、session 重連後 symlink 也可能不在了
+BIN = '/content/local_binarized'
+
 def collect_ids(root, key, n_classes):
     ids = []
     for p in sorted(Path(root).glob('*.npz')):
         with np.load(p) as d:
             ids.append(d[key])
+    if not ids:  # glob 抓不到任何 .npz → 路徑錯，給明確訊息而非 concatenate 的 cryptic error
+        raise RuntimeError(f"no .npz found under {root} — 路徑對嗎？")
     return np.concatenate(ids)
 
 # Phoneme JSD
-m4_ph = collect_ids('data/binarized/m4singer', 'phoneme_id', 200)
-vv_ph = collect_ids('data/binarized/vocalverse', 'phoneme_id', 200)
+m4_ph = collect_ids(f'{BIN}/m4singer', 'phoneme_id', 200)
+vv_ph = collect_ids(f'{BIN}/vocalverse', 'phoneme_id', 200)
 p_m4 = frame_freq_distribution(m4_ph, 200)
 p_vv = frame_freq_distribution(vv_ph, 200)
 jsd_ph = jensen_shannon_divergence(p_m4, p_vv)
 
 # Register JSD
-m4_reg = collect_ids('data/binarized/m4singer', 'register_id', 5)
-vv_reg = collect_ids('data/binarized/vocalverse', 'register_id', 5)
+m4_reg = collect_ids(f'{BIN}/m4singer', 'register_id', 5)
+vv_reg = collect_ids(f'{BIN}/vocalverse', 'register_id', 5)
 p_m4 = frame_freq_distribution(m4_reg, 5)
 p_vv = frame_freq_distribution(vv_reg, 5)
 jsd_reg = jensen_shannon_divergence(p_m4, p_vv)
@@ -749,8 +755,9 @@ print(f'JSD(register): {jsd_reg:.4f}  {"PASS" if jsd_reg < 0.05 else "FAIL"} (< 
 ## 8. Phase 0 Gate ④：PPG cluster 品質檢查（5 分鐘）
 
 ```python
+# ⚠ --binarized-root 用絕對路徑（同 §7，不靠 symlink）
 !PYTHONPATH=. python -m scripts.cluster_ppg_inspect \
-    --binarized-root data/binarized \
+    --binarized-root /content/local_binarized \
     --datasets m4singer vocalverse \
     --phoneme-vocab-size 200 \
     --out-dir outputs/phase0_cluster_inspect
