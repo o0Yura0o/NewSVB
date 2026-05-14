@@ -457,9 +457,9 @@ for name in ['phase0_audio_quality_raw', 'phase0_audio_quality_dereverbed']:
 >
 > **未來優化（backlog，非現在）**：M4Singer 6 個 5s clip 拼成 1 個 30s 餵 Whisper batch → Whisper forward 砍 ~6x，M4 可降到 ~2-3h。需改 [ppg_whisper.py](../nsvb/data/feature_extract/ppg_whisper.py) + [binarizer.py](../nsvb/data/binarizer.py)。
 
-### 6.0 啟動 local-write + background sync pattern（**必跑，§6.1–6.3 共用**）
+### 6.0 啟動 local-write + background sync pattern（**必跑，§6.1–6.5 共用**）
 
-跑 binarize **之前**先設定好本地目錄與背景同步。這個 cell 跑一次，sync thread 會持續到 §6.4 顯式停止（或 runtime restart）：
+跑 binarize **之前**先設定好本地目錄與背景同步。這個 cell 跑一次，sync thread 會持續到 §6.5 顯式停止（或 runtime restart）：
 
 ```python
 import os, time, subprocess, threading
@@ -562,9 +562,71 @@ print(f'local: {local} / 20896  |  drive: {drive} / 20896')
 !ls /content/drive/MyDrive/NSVB-ZH/data/binarized/vocalverse/ | head -3
 ```
 
-### 6.3 PPG k-means → phoneme_id（30-60 分鐘）
+### 6.3 Binarize 完整性驗證（必跑，~30 min–2 h）
 
-cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key），背景 sync 會自動偵測 mtime 更新並把 ~42K .npz 重新 sync 到 Drive。
+binarize 跑完不代表資料正確。Colab 中斷過 session 時，這些破綻 binarize 自己不會報：
+- **背景 rsync 中途被打斷** → Drive 上留下截斷的 .npz（`np.load` 報 `BadZipFile`）
+- **`np.savez` 寫到一半 session 被殺** → local 留下截斷檔，rsync 照樣推上 Drive
+- **VV：整首被 skip 但 chunk 沒切完** → binarizer 用 `__c000.npz` 是否存在當「整首已處理」的代表；某首在切 chunk 途中被中斷、`c000` 已 sync 到 Drive 但 `c016+` 沒 → 下個 session 看到 `c000` 就永久 skip 這首 → 缺尾。每個倖存的 .npz 本身都是好的，**錯的是數量**
+
+**對 Drive 跑兩支診斷腳本**（local 不完整，Drive 才是累積完整集）：
+
+```python
+%cd /content/NSVB-ZH
+
+# (1) verify：逐檔檢查可載入 / key 齊 / shape 一致 / 無 NaN-Inf；
+#     並印「來源錄音」數（M4 應 ≈ 20896；VV chunk 對應的不同來源錄音應 = 536）
+!PYTHONPATH=. python scripts/verify_binarized.py \
+    --root /content/drive/MyDrive/NSVB-ZH/data/binarized \
+    --dataset m4singer vocalverse
+
+# (2) reconcile：只對 VV——從原始 wav 時長推算「每首應有幾個 chunk」，
+#     比對 Drive 上實際 chunk 數，抓「整首被 skip 但 chunk 沒切完」的缺尾
+!PYTHONPATH=. python scripts/reconcile_vv_chunks.py \
+    --vv-source /content/drive/MyDrive/NSVB-ZH/data/VocalVerse \
+    --binarized-root /content/drive/MyDrive/NSVB-ZH/data/binarized
+```
+
+| 失敗模式 | verify | reconcile |
+|---|---|---|
+| 個別 .npz 截斷 / 損毀 | ✅ | — |
+| M4Singer 整首缺（不切 chunk）| ✅ 看「來源錄音」≈ 20896 | 不適用 |
+| VV 整首被 skip 但 chunk 沒切完 | ❌ 抓不到 | ✅ |
+
+**有缺料時**：兩支腳本都會把問題 item_id 寫成清單檔（`*_bad_npz.txt` / `vocalverse_incomplete.txt`）。照腳本印的指令刪掉那些殘檔（VV 要連 `c000` 一起刪，否則 `skip_existing` 會繼續跳過），回 §6.1/§6.2 重跑 binarize 補回缺的那幾首即可（只補缺的，幾分鐘）。**全部齊全、壞檔 = 0 才往下做 §6.4。**
+
+### 6.4 PPG k-means → phoneme_id（30-60 分鐘）
+
+⚠ **前置條件：cluster_ppg 必須看到「完整」dataset**。它兩個 stage 都掃 `--binarized-root` 底下「所有」.npz：
+- **fit**：從每首歌抽 200 frames fit k-means → 只看到部分資料 → centroids 分布偏掉
+- **assign**：對「每一個」.npz in-place 重寫加 `phoneme_id` → 沒掃到的檔永遠缺 `phoneme_id`，訓練時 D_z 無法用
+
+**問題**：若你 binarize 跨過中斷的 session（用 `--skip-check-extra-dir`），`/content/local_binarized` 只有「最後一個 session 新做的部分」——被 skip 的歷史檔只在 Drive 上，沒寫進 local。此時直接對 local 跑 cluster_ppg 是錯的。
+
+**先驗證 Drive 這份完整健康，再把完整集拉回 local**：
+
+```python
+# (a) 先確認 Drive 上的 binarize 完整無損（§6.3）
+#     verify_binarized.py + reconcile_vv_chunks.py 都過了再往下
+
+# (b) 把 Drive 完整集 rsync 回 local（~110 GB；首次拉回較久，之後增量很快）
+import subprocess
+subprocess.run(['rsync', '-au',
+    '/content/drive/MyDrive/NSVB-ZH/data/binarized/',
+    '/content/local_binarized/'], check=True)
+
+# (c) 確認 local 檔數 = Drive 檔數（兩邊應一致）
+for ds in ['m4singer', 'vocalverse']:
+    for label, root in [('local', '/content/local_binarized'),
+                        ('drive', '/content/drive/MyDrive/NSVB-ZH/data/binarized')]:
+        n = subprocess.check_output(
+            f'find {root}/{ds} -name "*.npz" | wc -l', shell=True).decode().strip()
+        print(f'  {ds} {label}: {n}')
+```
+
+> 若是「單一不中斷 session 跑完 binarize」，local 本來就完整，(b)/(c) 可跳過直接往下。
+
+cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key），背景 sync 會自動偵測 mtime 更新並把 ~42K .npz 重新 sync 到 Drive：
 
 ```python
 !PYTHONPATH=. python -m nsvb.data.cluster_ppg \
@@ -574,9 +636,11 @@ cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key）�
     --stage all
 ```
 
-> **注意**：phoneme_id 加進去後 Drive 上的 ~42K .npz 全部要重 sync 一輪（~10-30 min；rsync `-u` 偵測 mtime）。耐心等 §6.4 final sync 確認都同步完。
+> **為什麼對 local 跑而不直接指 Drive**：assign stage 對每個 .npz 做 `np.savez_compressed` 重寫，~42K 檔走 Drive FUSE 極慢；且 in-place 重寫直接動 Drive，中途掛掉會寫壞 Drive 的 .npz 而沒有備份。對 local 跑＝在 SSD 上快、Drive 保持完好當備份、§6.0 背景 sync 再推回。
 
-### 6.4 ⚠ 全部跑完後，**停 sync + 強制最後一次 rsync**
+> **注意**：phoneme_id 加進去後 Drive 上的 ~42K .npz 全部要重 sync 一輪（~10-30 min；rsync `-u` 偵測 mtime）。耐心等 §6.5 final sync 確認都同步完。
+
+### 6.5 ⚠ 全部跑完後，**停 sync + 強制最後一次 rsync**
 
 ```python
 print('Stopping background sync...')
@@ -883,7 +947,8 @@ PYTHONPATH=. python -m nsvb.task.stage1 \
 | | §5 Gate ② audio quality probe（兩跑 raw + dereverb） | ~20 min | — | <10 MB | 必要 |
 | | §6.1 binarize M4Singer（Whisper 30s 視窗 bottleneck）| **11-12 h** | — | 46 GB | 必要 |
 | | §6.2 binarize VocalVerse | **3-5 h** | — | 64 GB | 必要 |
-| | §6.3 cluster_ppg | 30-60 min | — | (in-place) | 必要 |
+| | §6.3 binarize 完整性驗證（verify + reconcile）| 30 min–2 h | — | <1 MB | 必要 |
+| | §6.4 cluster_ppg（含 rsync Drive→local 補完整）| 1-2 h | — | (in-place) | 必要 |
 | | §7 Gate ③ JSD | 5 min | — | <1 MB | 必要 |
 | | §8 Gate ④ cluster inspect | 5 min | — | <10 MB | 必要 |
 | | §9.2 壓縮 | 1 h | — | +85 GB | 可選 |
