@@ -609,6 +609,20 @@ binarize 跑完不代表資料正確。Colab 中斷過 session 時，這些破�
 # (a) 先確認 Drive 上的 binarize 完整無損（§6.3）
 #     verify_binarized.py + reconcile_vv_chunks.py 都過了再往下
 
+# (a0) ⚠ 停掉 §6.0 的背景 sync —— §6.4 全程不能有它在跑：
+#   1. 等下要 rsync Drive→local，背景 sync 是反方向的 rsync local→Drive，
+#      兩個在同一個 FUSE mount 上對撞，純浪費頻寬
+#   2. cluster_ppg 用 np.savez_compressed「就地重寫」.npz —— 這個寫入「不是原子」的
+#      （直接 truncate + 逐步寫，沒有 temp-file-rename）。背景 sync 若剛好在某個
+#      .npz 寫到一半時掃到它，會把截斷的半成品推上 Drive → 壞檔
+try:
+    _sync_stop.set()
+    sync_thread.join(timeout=10)
+    print('背景 sync 已停')
+except NameError:
+    print('sync thread 變數不在（多半已隨之前的 session 結束而消失）—— 無需處理')
+# 並確認此後「不要」重新跑 §6.0 啟動 sync，直到 §6.5
+
 # (b) 把 Drive 完整集 rsync 回 local（~110 GB；首次拉回較久，之後增量很快）
 import subprocess
 subprocess.run(['rsync', '-au',
@@ -626,7 +640,7 @@ for ds in ['m4singer', 'vocalverse']:
 
 > 若是「單一不中斷 session 跑完 binarize」，local 本來就完整，(b)/(c) 可跳過直接往下。
 
-cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key），背景 sync 會自動偵測 mtime 更新並把 ~42K .npz 重新 sync 到 Drive：
+cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key）。背景 sync 已在 (a0) 停掉，cluster_ppg 全程無 sync 干擾；phoneme_id 的變更等它**完整跑完後**由 §6.5 的 final rsync 一次乾淨推回 Drive：
 
 ```python
 !PYTHONPATH=. python -m nsvb.data.cluster_ppg \
@@ -643,9 +657,13 @@ cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key）�
 ### 6.5 ⚠ 全部跑完後，**停 sync + 強制最後一次 rsync**
 
 ```python
-print('Stopping background sync...')
-_sync_stop.set()
-sync_thread.join(timeout=10)
+print('Stopping background sync (if running)...')
+try:
+    _sync_stop.set()
+    sync_thread.join(timeout=10)
+    print('  background sync stopped')
+except NameError:
+    print('  sync thread 變數不在（已隨之前 session 結束，或 §6.4 (a0) 已停）—— skip')
 
 print('Final rsync local → Drive (this catches any pending writes)...')
 result = subprocess.run(
