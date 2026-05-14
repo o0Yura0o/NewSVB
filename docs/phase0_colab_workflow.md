@@ -615,12 +615,23 @@ binarize 跑完不代表資料正確。Colab 中斷過 session 時，這些破�
 #   2. cluster_ppg 用 np.savez_compressed「就地重寫」.npz —— 這個寫入「不是原子」的
 #      （直接 truncate + 逐步寫，沒有 temp-file-rename）。背景 sync 若剛好在某個
 #      .npz 寫到一半時掃到它，會把截斷的半成品推上 Drive → 壞檔
+#   ⚠ 注意：_sync_stop.set() 只讓迴圈在下一個檢查點退出，無法中斷正在執行的
+#   subprocess.run(rsync...)；join(timeout=N) 超時只是 return，不會殺 thread。
+#   必須真的「等到 thread 結束」+ 確認沒有殘留 rsync 子程序，才算安全。
 try:
     _sync_stop.set()
-    sync_thread.join(timeout=10)
-    print('背景 sync 已停')
+    while sync_thread.is_alive():
+        print('  等背景 sync 跑完當前這輪 rsync...')
+        sync_thread.join(timeout=30)
+    print('背景 sync thread 已結束')
 except NameError:
     print('sync thread 變數不在（多半已隨之前的 session 結束而消失）—— 無需處理')
+
+import subprocess
+_left = subprocess.run(['pgrep', '-a', 'rsync'],
+                       capture_output=True, text=True).stdout.strip()
+print('⚠ 仍有 rsync 程序在跑:\n' + _left if _left
+      else '✅ 無殘留 rsync 程序，可安全進行 §6.4')
 # 並確認此後「不要」重新跑 §6.0 啟動 sync，直到 §6.5
 
 # (b) 把 Drive 完整集 rsync 回 local（~110 GB；首次拉回較久，之後增量很快）
@@ -658,12 +669,22 @@ cluster_ppg 對 local 跑（in-place 修改每個 .npz 加 `phoneme_id` key）�
 
 ```python
 print('Stopping background sync (if running)...')
+# _sync_stop.set() 只觸發迴圈在下個檢查點退出，不會中斷進行中的 rsync；
+# join(timeout) 超時只是 return 不殺 thread。必須真的等到 thread 結束。
 try:
     _sync_stop.set()
-    sync_thread.join(timeout=10)
-    print('  background sync stopped')
+    while sync_thread.is_alive():
+        print('  等背景 sync 跑完當前這輪 rsync...')
+        sync_thread.join(timeout=30)
+    print('  background sync thread 已結束')
 except NameError:
     print('  sync thread 變數不在（已隨之前 session 結束，或 §6.4 (a0) 已停）—— skip')
+
+import subprocess
+_left = subprocess.run(['pgrep', '-a', 'rsync'],
+                       capture_output=True, text=True).stdout.strip()
+if _left:
+    print('⚠ 仍有 rsync 程序，等它結束再往下:\n' + _left)
 
 print('Final rsync local → Drive (this catches any pending writes)...')
 result = subprocess.run(
