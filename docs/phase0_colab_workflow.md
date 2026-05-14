@@ -266,6 +266,7 @@ VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/mod
     numpy==1.26.4 scipy==1.13.0 librosa==0.10.2 soundfile==0.12.1 \
     resampy==0.4.3 scikit-learn==1.5.1 scikit-image==0.24.0 -q
 
+# Step 4a：主依賴列表（⚠ protobuf 不能放這裡，見 4b 說明）
 !pip install \
     pytorch-lightning==1.9.5 \
     pyloudnorm==0.1.1 \
@@ -278,20 +279,29 @@ VOCODER_CKPT = '/content/drive/MyDrive/nsvb_ckpts/1012_hifigan_all_songs_nsf/mod
     pandas==2.2.2 openpyxl==3.1.5 tensorboard==2.17.0 tqdm==4.66.4 \
     pyyaml==6.0.2 \
     matplotlib==3.9.1 portalocker==2.10.1 filelock==3.15.4 tabulate==0.9.0 \
-    "protobuf>=5.28.0" \
     -q
 
-# ⚠ protobuf>=5.28 必要：Colab 預載的 sentencepiece（Whisper tokenizer 依賴）
-# 是用 protobuf 5.x 工具鏈生成的，需要 runtime_version API（5.26+ 才有）。
-# tensorboard==2.17.0 雖 explicit 要求 protobuf<5，但 Stage 1/2 寫 event 檔功能
-# 與 protobuf 5+ 仍相容；不裝 protobuf 5 反而會在 binarize 載 Whisper 時
-# `cannot import name 'runtime_version' from 'google.protobuf'`
+# Step 4b：protobuf 5.28 必須「單獨命令 --upgrade」，不能併進 4a
+# ⚠ 為什麼分開：tensorboard==2.17.0 explicit 要求 protobuf<5；若 protobuf>=5.28
+#   與 tensorboard==2.17.0 放同一個 pip install，resolver 解不開 → ResolutionImpossible
+#   整批都不裝。分開命令時 pip 先裝完 tensorboard（連同 protobuf 4.x），4b 再
+#   --upgrade 覆蓋成 5.28，只印 non-fatal warning（tensorboard 2.17 dep 不滿足）。
+# ⚠ 為什麼一定要 protobuf>=5.28：Colab 預載的 sentencepiece（Whisper tokenizer 依賴）
+#   是用 protobuf 5.x 工具鏈生成的，需要 runtime_version API（5.26+ 才有）；
+#   protobuf 4.x 下 binarize 載 Whisper 會
+#   `cannot import name 'runtime_version' from 'google.protobuf'`
+# binarize 不用 tensorboard；Stage 1/2 寫 event 檔功能與 protobuf 5+ 仍相容。
+!pip install --upgrade "protobuf>=5.28.0" -q
 
 # ⭐ 必要：裝完後 restart runtime
 # 因為 §3.2 之前 import 過 numpy（mount Drive 也會載 numpy），降版後的新 .so
 # 不會生效，必須 restart Python process 才能載入一致版本
-print("\n=== 請手動 Runtime → Restart runtime（Ctrl+M .），然後重做 §3.2 / §3.3 / §3.5（不用重跑 §3.4）===")
+print("\n=== 請手動 Runtime → Restart runtime（Ctrl+M .）===")
 ```
+
+> **Restart 後該重跑什麼**——分兩種情境：
+> - **同一 session 內首次裝完後的 restart**（你剛跑完 §3.4 第一次）：restart 後 pip 套件**還在 disk 上**，只需重做 §3.2 / §3.3 / §3.5（mount + git + symlink），**不用重跑 §3.4**。
+> - **全新 session / runtime 完全重啟**（Colab timeout 重連、隔天重開）：`/content/` 整個被清空，**pip 套件全失**，必須**完整重跑 §3.4**。漏跑會在 binarize 時踩 `ModuleNotFoundError: No module named 'pyloudnorm'` 之類。
 
 > **若 wheel 路徑不存在**（沒做 Stage A §2.4 步驟 4 的 `pip wheel`）：
 > 把 `deepfilternet==0.5.6` 加回主 pip line，**並先裝 Rust**：`!curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && export PATH=/root/.cargo/bin:$PATH`，會多花 ~5-10 min 編譯。
@@ -439,9 +449,13 @@ for name in ['phase0_audio_quality_raw', 'phase0_audio_quality_dereverbed']:
 
 ---
 
-## 6. Phase 0 Binarize（~5-7 小時 with local-write + sync，**可中斷續跑**）
+## 6. Phase 0 Binarize（~15-18 小時，**可中斷續跑**）
 
-⭐ **Colab IO 優化**：寫到 Drive 直接會被 FUSE overhead 拖到 12-18h；改寫**本地 SSD `/content/local_binarized/`**（100-300 MB/s）+ **背景 rsync 每分鐘同步到 Drive**，總時間降到 **~5-7h**，省 ~5-9h。
+⭐ **Colab IO 優化**：寫到 Drive 直接會被 FUSE overhead 額外拖慢；改寫**本地 SSD `/content/local_binarized/`**（100-300 MB/s）+ **背景 rsync 每分鐘同步到 Drive**，省下 IO 等待時間。
+
+> **⚠ 時間瓶頸是 Whisper compute，不是 IO**：Whisper-large-v3 強制 30 秒視窗，M4Singer 每個 5-sec snippet 仍要跑完整 30s forward（25s 是 padding 浪費）。21K snippets × 1 forward each ≈ **M4Singer ~11-12h**。VocalVerse 整首 200s 跑 Whisper（內部切 ~7 個 30s 視窗），536 songs ≈ **VV ~3-5h**。local-write 只省 IO，省不了這個 compute floor。
+>
+> **未來優化（backlog，非現在）**：M4Singer 6 個 5s clip 拼成 1 個 30s 餵 Whisper batch → Whisper forward 砍 ~6x，M4 可降到 ~2-3h。需改 [ppg_whisper.py](../nsvb/data/feature_extract/ppg_whisper.py) + [binarizer.py](../nsvb/data/binarizer.py)。
 
 ### 6.0 啟動 local-write + background sync pattern（**必跑，§6.1–6.3 共用**）
 
@@ -499,7 +513,7 @@ print('✅ Background sync started (local → Drive, every 60s)')
 
 ```python
 %cd /content/NSVB-ZH
-# M4Singer 21K snippets，~3-5h on A100 with local-write
+# M4Singer 21K snippets，~11-12h on A100（Whisper 30s 視窗 padding 是 bottleneck）
 !PYTHONPATH=. python -m nsvb.data.binarizer \
     --dataset m4singer \
     --data-root data \
@@ -520,7 +534,7 @@ print(f'local: {local} / 20896  |  drive: {drive} / 20896')
 # 目標：local 接近 20896；drive 落後本地最多 60s（一輪 sync 週期）
 ```
 
-### 6.2 跑 VocalVerse（含 amateur_score 過濾 + chunk 切片，~2-3h）
+### 6.2 跑 VocalVerse（含 amateur_score 過濾 + chunk 切片，~3-5h）
 
 ```python
 !PYTHONPATH=. python -m nsvb.data.binarizer \
@@ -866,9 +880,9 @@ PYTHONPATH=. python -m nsvb.task.stage1 \
 | | §2.8 上傳 vocoder ckpt | — | 2 min | 200 MB | 必要 |
 | **Stage B** | §3 環境 setup（重連也走這） | 5-10 min | — | — | 必要 |
 | | §4 Gate ① vocoder identity（兩跑 raw + loud_norm） | ~35 min | — | <100 MB | **dealbreaker** |
-| | §5 Gate ② audio quality probe | 5 min | — | <10 MB | 必要 |
-| | §6.1 binarize M4Singer | 6-10 h | — | 46 GB | 必要 |
-| | §6.2 binarize VocalVerse | 6-10 h | — | 64 GB | 必要 |
+| | §5 Gate ② audio quality probe（兩跑 raw + dereverb） | ~20 min | — | <10 MB | 必要 |
+| | §6.1 binarize M4Singer（Whisper 30s 視窗 bottleneck）| **11-12 h** | — | 46 GB | 必要 |
+| | §6.2 binarize VocalVerse | **3-5 h** | — | 64 GB | 必要 |
 | | §6.3 cluster_ppg | 30-60 min | — | (in-place) | 必要 |
 | | §7 Gate ③ JSD | 5 min | — | <1 MB | 必要 |
 | | §8 Gate ④ cluster inspect | 5 min | — | <10 MB | 必要 |

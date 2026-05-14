@@ -186,6 +186,19 @@ python -m nsvb.data.binarizer --dataset vocalverse \
     --vocalverse-chunk-sec 5.0
 ```
 
+##### 已知限制：固定 stride 會切穿少數連音 ⚠
+
+固定 5s stride **不做 silence-aware / phrase-aware 對齊**，會切穿連音、vibrato、melisma。粗估每首 200s 歌 39 個內部邊界，約 **~6.5% 的音符在邊界被切**（200s × ~3 notes/s ≈ 600 notes，39 個被切）。
+
+**為什麼仍可接受**（決定不在 Phase 0 修）：
+1. **切點特徵乾淨**：mel / F0 / PPG 是在連續整首音訊上算完才 `chunk_sample` 切片（純 array slicing），chunk 邊界**無 STFT edge artifact**
+2. **架構對 phrase 完整性不敏感**：Stage 1 CVAE 是 mel→mel 重建、Stage 2 M 是 kernel=1 pointwise + PatchNCE frame-wise——都逐 frame 運作，不依賴「sample 是否完整 phrase」
+3. **chunk 內 ~97% 動態完整**：5s chunk 含 ~25-35 個 vibrato cycle，只有邊界 1 個被切；模型也看到大量完整 phrase 的 chunk（~93.5%）
+
+**未來若聽測發現 phrase 級 choppy artifact 才回頭做**（backlog，二選一）：
+- **silence-aware snap**（~20 行）：用已存的 `voicing` array，在每個 target 邊界 ±0.5s 內 snap 到最近 unvoiced frame；連續演唱無空隙才 fallback 硬切
+- **overlap chunking**（~5 行）：5s chunk + 1s overlap（hop=4s），每個跨邊界音符至少在某 chunk 完整出現一次；代價是 chunks +25%
+
 ### 1.2 抽取的特徵（per song → 一個 .npz）
 
 **腳本**：`nsvb/data/binarizer.py`，sequential GPU 處理。

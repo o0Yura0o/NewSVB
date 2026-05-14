@@ -234,6 +234,33 @@
   - **Risk 2 L5** monitor (unvoiced_concentration) 直接抓此 failure
 - **已實作緩解**：[Stage2Config.dmel_mix_amateur_real](nsvb/task/stage2.py) + CLI `--dmel-mix-amateur-real`（預設 off）；訓中 monitor 顯示 `unvoiced_concentration > 0.65` 連續兩次時 resume 啟用作 fallback 救火
 
+#### 3. L_adv_mel 用業餘 F0 conditioning → M 被推去補償它管不到的 F0 痕跡 — ⚠️ 部分緩解
+- **原描述**：[`_decode_with_mapped_z`](nsvb/task/stage2.py) 解碼 `M(z_a)` 時，condition `g` 由業餘端
+  `(ppg, f0, spk_emb)` 建，`l_adv_mel` 對這個帶業餘 F0 的 mel 算對抗 loss。疑慮：合成 mel 與
+  L_adv_mel 會不會錯誤獎懲 M。
+- **判讀（梯度鏈是乾淨的）**：`g` 對 M 而言是常數，不在 M 的優化變數裡；`∂l_adv_mel/∂M` 只經
+  θ 對 z 輸入的 Jacobian（固定 g 下求值）回傳。**M 不會因為 F0 本身收到梯度** — F0 通道完全
+  不傳梯度給 M。`mel_baseline = θ(z_a, g)` 與 `mel_g = θ(M(z_a), g)` 共用同一 `g`，唯一差別
+  是 `z_a` vs `M(z_a)`。
+- **真實的 confound（訊號來源層面）**：`mel_g` 是「業餘 F0 ⊗ M 的 z 編輯」的聯合產物；D_mel 的
+  real 是純 pro mel（pro F0 生成）。D_mel 判 `mel_g` 為假時無法歸因是「z 音色不夠 pro」還是
+  「F0 軌跡是業餘的」。若扣分有一部分來自業餘 F0 痕跡，M 唯一槓桿是改 z → **可能被推去扭曲 z
+  來遮掩它根本修不了的 F0 缺陷**。亦即 D_mel 的 domain gap 有個 M 關不掉的非零地板。
+- **為什麼不是 bug**：Mode A 推理本來就用業餘 F0（保留業餘表情、只修音色），訓練用業餘 F0
+  conditioning 與部署一致，無 train/test mismatch；且 unpaired 資料根本沒有配對 pro F0 可用。
+- **架構主防線已存在**：
+  - λ_adv_mel = 0.2 << λ_adv_z = 1.0 = λ_patchnce：M 主訊號是 z 空間、F0 無關（L_adv_z、
+    PatchNCE），L_adv_mel 只是輕推 → confound 被降權 5×
+  - `monitor_audio_quality` 的 `voiced_spectral_ratio < 0.4` 直接抓「M 在改 F0 trajectory」
+  - Failure mode B (`temporal_diff_ratio > 1.0`) 抓「M 重寫時間結構」
+  - VocalVerse 已 MOS 篩到 `amateur_score ≤ 3.0`（技巧+氣息），篩掉的是音色/技巧業餘而非音準
+    大歪的樣本 → 業餘 F0 軌跡不致誇張到讓 D_mel 主要靠它判別 → confound 實務上估為二階小量
+- **已實作緩解**：與 #2 共用 [`--dmel-mix-amateur-real`](nsvb/task/stage2.py) fallback——啟用後
+  D_mel real 混入 amateur，消掉「永遠關不掉的 F0 domain gap」。觸發條件同 #2（monitor 連兩次
+  異常時 resume 啟用）。
+- **觀察條件**：訓中 `voiced_spectral_ratio` 持續 < 0.4 或 `temporal_diff_ratio` > 1.0 →
+  confound 正在發作。
+
 ---
 
 ### 三、 邊界條件與小細節

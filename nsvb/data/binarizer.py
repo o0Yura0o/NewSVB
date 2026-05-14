@@ -300,6 +300,18 @@ def chunk_sample(
       切 chunk 後同首所有 chunks 仍是同一歌手；每 chunk 各自存一份 spk_emb 才能
       獨立載入。重複的成本只 1 KB × N chunks，可忽略。
 
+    【已知限制：固定 stride 會切穿少數連音】
+      固定 chunk_sec stride 不做 silence-aware / phrase-aware，會切穿連音 / vibrato /
+      melisma；粗估每首 200s 約 ~6.5% 音符在邊界被切。決定不在 Phase 0 修，因為：
+        1. 切點特徵乾淨：mel/F0/PPG 在連續整首音訊上算完才切片（純 array slicing），
+           chunk 邊界無 STFT edge artifact
+        2. 架構對 phrase 完整性不敏感：Stage 1 mel→mel 重建、Stage 2 M 是 kernel=1
+           pointwise + PatchNCE frame-wise，皆逐 frame 運作
+        3. chunk 內 ~97% 動態完整（5s 含 ~25-35 vibrato cycle，只邊界 1 個被切）
+      未來若聽測發現 phrase 級 choppy artifact 才回頭做 silence-aware snap（用
+      voicing array snap 到最近 unvoiced frame）或 overlap chunking。
+      詳見 training_flow.md §1.1.2「已知限制」。
+
     Args:
         sample:            binarize_one 的輸出
         chunk_sec:         每個 chunk 的目標長度（秒）
