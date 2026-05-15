@@ -208,7 +208,9 @@
 - **已實作緩解**：
   - 新增 **Gate ④** [`scripts/cluster_ppg_inspect.py`](scripts/cluster_ppg_inspect.py)：抽樣計算 `MI(phoneme_id; register_id)` 與 voiced 段 cluster dwell length；同時畫時間序列疊圖供眼睛交叉檢查 sustained / vibrato 段 cluster 是否穩定
   - 健康閾值：`MI < 0.3 bit`、`mean dwell ≥ 8 frames`
+  - [`nsvb/data/cluster_ppg.py`](nsvb/data/cluster_ppg.py) 新增 `--per-utt-mean-norm` flag：對每首 PPG 沿時間軸取均值並減掉再 fit/assign，移除整曲層級 pitch baseline；fit + assign 兩階段必須一致設定
 - **WARNING 補救順序**：降 K → 換 Whisper layer (6 或 10) → PPG per-utterance 去 DC → phoneme_id mode filter
+- **實測結果（2026-05-15，詳見 [phase0_log.md](docs/phase0_log.md)）**：Gate ④ 在 v1 K=200 設定下 **抓到** M4Singer MI = 0.862 bit（VocalVerse 0.178 healthy；非對稱來自 M4 廣音域 vs VV 窄音域）；99/200 cluster 被單一 dataset 獨佔 → 跨資料集 phoneme JSD 0.43。套用「降 K(200→100) + per-utterance 去 DC」後 M4 MI 降到 **0.216 bit**（healthy）、phoneme JSD 降到 0.16（-63%）、99/200 dataset-pure 大幅下降。殘餘 0.16 屬中文 tonal 語言固有 phoneme-pitch 相關 + 兩 dataset 曲目差異，不再追求 hard threshold 0.05；改由 Phase 2 訓練端（D_z spectral norm / register-balanced sampling / 降 λ_adv_z）處理。
 
 ---
 
