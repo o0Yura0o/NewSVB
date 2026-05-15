@@ -114,6 +114,7 @@ def collect_ppg_samples(
     frames_per_song: int = DEFAULT_FRAMES_PER_SONG,
     seed: int = RANDOM_STATE,
     max_total_frames: int = DEFAULT_MAX_TOTAL_FRAMES,
+    per_utt_mean_norm: bool = False,
 ) -> np.ndarray:
     """
     從每個 .npz 隨機抽 `frames_per_song` 個 PPG frames（避開首尾各 5 frame
@@ -132,10 +133,21 @@ def collect_ppg_samples(
       若 檔案數 × frames_per_song 失控（VocalVerse 切 chunk 後檔案數 ~42K），
       峰值會撐爆 Colab RAM 被 OOM kill。收集到上限就停 —— k-means fit 對 K=200
       而言 ~2-4M frames 早已遠超需求，再多只是浪費記憶體。
+
+    為什麼 per_utt_mean_norm（Risk 2b 補強）：
+      Whisper layer 8 PPG 對歌聲帶 pitch / prosody 殘留訊號（見 risk.md Risk 2b）。
+      在跨資料集（M4Singer 廣音域、VocalVerse 窄音域）情境下會造成 k-means cluster
+      跟 register 強相關 → cluster 沿 dataset 邊界分裂 → 跨資料集 phoneme JSD 爆。
+      實測：未做 DC removal 時 M4 的 MI(phoneme;register) 達 0.862 bit、phoneme JSD 0.43。
+      每首歌沿時間軸取 PPG mean 後減掉，移除「整曲層級的 pitch / 錄音域基線」，
+      保留每個 frame 相對於該首歌的「動態 phonetic 內容」。
+      ⚠ fit 跟 assign 兩階段必須帶相同 flag，否則 centroids 跟 query 不在同坐標系。
     """
     rng = np.random.default_rng(seed)
     pieces = []
     total = 0  # running counter（取代每 100 檔 O(n) 重算 sum，避免 O(n²)）
+    if per_utt_mean_norm:
+        print("  [collect] per-utterance mean norm: ON（每首減去 PPG 時間軸均值）")
 
     for i, p in enumerate(npz_paths):
         try:
@@ -154,9 +166,18 @@ def collect_ppg_samples(
         if len(valid) == 0:
             continue
 
+        # 為什麼把 ppg 整段轉 fp32 再做 mean / 採樣：
+        #   per-utt mean 在 fp16 數值精度不穩；採樣若先 indexing 再轉 fp32，
+        #   減 mean 時兩者 dtype 一致較簡單。代價是該檔記憶體峰值 ~2× 短暫，
+        #   每檔 [~850,1280] fp32 = ~4 MB，不影響整體上限
+        ppg_full = ppg.astype(np.float32)
+        if per_utt_mean_norm:
+            # 對 valid 範圍取均值，扣掉（含邊界 frames 也一起扣同一個常數）
+            mean_vec = ppg_full[valid].mean(axis=0, keepdims=True)  # [1, 1280]
+            ppg_full = ppg_full - mean_vec
         n = min(frames_per_song, len(valid))
         idx = rng.choice(valid, size=n, replace=False)
-        pieces.append(ppg[idx].astype(np.float32))
+        pieces.append(ppg_full[idx])
         total += n
 
         if (i + 1) % 100 == 0:
@@ -219,6 +240,7 @@ def assign_phoneme_id(
     npz_paths: List[Path],
     centroids: np.ndarray,
     overwrite: bool = False,
+    per_utt_mean_norm: bool = False,
 ) -> int:
     """
     對每個 .npz：載入 ppg → 用 centroids 分群 → 把 phoneme_id 寫回 .npz。
@@ -226,6 +248,9 @@ def assign_phoneme_id(
     Args:
         centroids: [K, 1280] fp32，k-means 訓練好的中心
         overwrite: True 則覆寫已有 phoneme_id；False 則 skip 已含 phoneme_id 的檔
+        per_utt_mean_norm: 若 True，對每檔 PPG 沿時間軸取均值並減掉再算距離。
+            ⚠ 必須跟 fit 階段的 per_utt_mean_norm 一致，否則 centroids 跟 query
+            不在同個坐標系，phoneme_id 會是亂的。見 collect_ppg_samples docstring。
 
     Returns:
         實際處理的檔案數量
@@ -239,6 +264,8 @@ def assign_phoneme_id(
     """
     centroids_f32 = centroids.astype(np.float32)
     processed = 0
+    if per_utt_mean_norm:
+        print("  [assign] per-utterance mean norm: ON（與 fit 階段必須一致）")
 
     for i, p in enumerate(npz_paths):
         with np.load(p, allow_pickle=True) as data:
@@ -250,6 +277,16 @@ def assign_phoneme_id(
             payload = {k: data[k] for k in keys}
 
         ppg = payload["ppg"].astype(np.float32)  # [T, 1280]
+        if per_utt_mean_norm:
+            # 與 collect_ppg_samples 一致：對 valid 範圍取均值，全 T 都扣掉
+            T = ppg.shape[0]
+            if T > 10:
+                valid_lo, valid_hi = 5, T - 5
+                mean_vec = ppg[valid_lo:valid_hi].mean(axis=0, keepdims=True)
+            else:
+                # 太短沒有 valid 範圍，用整段均值兜底
+                mean_vec = ppg.mean(axis=0, keepdims=True)
+            ppg = ppg - mean_vec
         # 直接算 squared euclidean distance：
         #   dist[t, k] = ||ppg[t] - centroids[k]||^2
         # 為什麼不直接用 km.predict：
@@ -324,6 +361,13 @@ def main():
         action="store_true",
         help="即使 .npz 已含 phoneme_id 仍覆寫",
     )
+    parser.add_argument(
+        "--per-utt-mean-norm",
+        action="store_true",
+        help="Risk 2b 補強：對每首 PPG 沿時間軸取均值並減掉，再 fit/assign。"
+             "移除整曲層級的 pitch/錄音域基線，降低 k-means cluster 跟 register 的相關性。"
+             "⚠ fit 跟 assign 必須帶相同 flag，否則 phoneme_id 全亂",
+    )
     args = parser.parse_args()
 
     root = Path(args.binarized_root)
@@ -344,6 +388,7 @@ def main():
             npz_paths,
             frames_per_song=args.frames_per_song,
             max_total_frames=args.max_total_frames,
+            per_utt_mean_norm=args.per_utt_mean_norm,
         )
         km = fit_kmeans(samples, k=args.k)
         np.save(centroids_path, km.cluster_centers_.astype(np.float32))
@@ -359,7 +404,11 @@ def main():
         assert centroids.shape[1] == WHISPER_HIDDEN_DIM, (
             f"Centroids dim {centroids.shape[1]} ≠ WHISPER_HIDDEN_DIM {WHISPER_HIDDEN_DIM}"
         )
-        n_done = assign_phoneme_id(npz_paths, centroids, overwrite=args.overwrite)
+        n_done = assign_phoneme_id(
+            npz_paths, centroids,
+            overwrite=args.overwrite,
+            per_utt_mean_norm=args.per_utt_mean_norm,
+        )
         print(f"Assigned phoneme_id to {n_done}/{len(npz_paths)} files")
 
 
