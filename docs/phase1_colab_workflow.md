@@ -102,6 +102,29 @@ for ds in ['m4singer', 'vocalverse']:
 !ls -la data/binarized
 ```
 
+### 1.5 切 train/val/test splits（**首次**訓練前跑一次,之後 session 也可重跑,seed 固定 → 結果相同）
+
+```python
+%cd /content/NSVB-ZH
+!PYTHONPATH=. python scripts/make_splits.py \
+    --binarized-root /content/local_binarized \
+    --m4-test-singers Alto-2 Tenor-3 \
+    --m4-val-songs-per-singer 2 \
+    --vv-test-singer-frac 0.10 \
+    --vv-val-utterance-frac 0.05 \
+    --seed 42
+# 產生 /content/local_binarized/splits/{train,val,test}.txt + report.json
+```
+
+切割設計細節見 [training_flow.md §1.6](training_flow.md)。預期輸出:
+- train ~38K(M4 ~18K + VV ~19K)
+- val ~2K
+- test ~4K(M4 2 整位歌手 + VV ~10% user)
+
+**為什麼明確指定 `--m4-test-singers`**:讓 holdout 在 git 內可見,reviewer 跟未來的你都知道測試集是哪兩位。要重新自動挑可改成 `--m4-test-singers` 不傳(seed 42 自動挑)。
+
+⚠ 注意:每次 session 重連如果重新 `make_splits.py`,**只要 seed 跟參數一樣,切割完全相同** —— 所以不用備份 split 檔到 Drive,當場再產生就好。
+
 ---
 
 ## 2. 啟動 ckpt local-write + background sync（**必跑**，跟 Phase 0 §6.0 同模式）
@@ -163,6 +186,7 @@ print('✅ ckpt sync started (local → Drive, every 120s)')
 
 # Stage 1 = CVAE pretrain，max_steps 80000
 # --init-from-nsvb 從 NSVB 1030 VAE-MLE ckpt 載入 backbone weight（cold start 比較久）
+# --split-dir 預設指 data/binarized/splits（§1.5 已產出），val loop 自動啟用
 !PYTHONPATH=. python -m nsvb.task.stage1 \
     --binarized-root data/binarized \
     --ppg-dim 1280 \
@@ -171,10 +195,19 @@ print('✅ ckpt sync started (local → Drive, every 120s)')
     --num-workers 4 \
     --init-from-nsvb /content/drive/MyDrive/nsvb_ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt \
     --ckpt-dir checkpoints/stage1 \
+    --split-dir data/binarized/splits \
+    --val-interval 1000 --val-max-batches 50 \
     2>&1 | tee logs/stage1_$(date +%Y%m%d_%H%M%S).log
 ```
 
-Cell 會持續輸出訓練 log（每 `log_interval` 步印一次 loss / it/s）。tensorboard 的 events 也寫在 `checkpoints/stage1/`，會被 background sync 推到 Drive。
+Cell 會持續輸出訓練 log:
+- 每 `log_interval` 步(50)印一次 train loss / it/s
+- 每 `val_interval` 步(1000)印一次 `[val step ...] val_l1=.. val_l2=.. val_kl=.. val_total=..`
+- val_total 創新低時自動存 `stage1_best.pt`,印 `[val] new best val_total=.. → saved stage1_best.pt`
+
+tensorboard 的 events 也寫在 `checkpoints/stage1/`,會被 background sync 推到 Drive。
+
+⭐ **Phase 1 結束時用 `stage1_best.pt` 而非 `stage1_latest.pt`** 給 Stage 2 接續 —— best 是 val loss 最低的 ckpt,代表泛化最好的時刻;latest 是最後一個 step,可能已 overfit。
 
 ### 預期速度
 A100 上估 ~1.0-1.5 it/s（FVAE encoder/decoder + KL loss）。80K steps ≈ 15-22h GPU 時間，**單一 Colab session 跑不完**，必須中斷 + resume 至少 1-2 次。
@@ -186,7 +219,9 @@ A100 上估 ~1.0-1.5 it/s（FVAE encoder/decoder + KL loss）。80K steps ≈ 15
 Session 斷掉重連後：
 
 ### 4.1 重做環境 setup
-§1.1–§1.4 全部重跑（mount + git + pip + symlink + 解壓 binarized + verify）。
+§1.1–§1.5 全部重跑(mount + git + pip + symlink + 解壓 binarized + verify + **重新 make_splits**)。
+
+⚠ §1.5 重跑要用**完全一樣的參數**(同 `--m4-test-singers`、`--seed`),否則切割變了會破壞訓練連續性 —— 等於 train/val 換了一批,resume 的 ckpt 拿錯資料訓。
 
 ### 4.2 從 Drive 拉回最新 ckpt 到 local
 

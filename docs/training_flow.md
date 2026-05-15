@@ -369,6 +369,41 @@ python -m scripts.cluster_ppg_inspect \
 3. **PPG per-utterance 去 DC**：binarize 時對每首歌 `ppg -= ppg.mean(axis=0)`，去除說話人/錄音常數偏移，再 k-means
 4. **phoneme_id mode filter**：對輸出 `phoneme_id` 跑長度 5 的 mode filter 平滑掉 1-2 frame 的瞬時跳變
 
+### 1.6 Train / Val / Test 切割（Phase 1/2 前置步驟）
+
+`cluster_ppg` 跑完、`phoneme_id` 寫回所有 .npz 之後、開始訓練之前，跑一次 [`scripts/make_splits.py`](../scripts/make_splits.py) 切出三份 item_id 列表：
+
+```bash
+python scripts/make_splits.py \
+    --binarized-root /path/to/binarized \
+    --m4-test-singers Alto-2 Tenor-3 \
+    --m4-val-songs-per-singer 2 \
+    --vv-test-singer-frac 0.10 \
+    --vv-val-utterance-frac 0.05 \
+    --seed 42
+# → /path/to/binarized/splits/{train,val,test}.txt  +  report.json
+```
+
+#### 切割原則（SVC/SVB 慣例）
+
+| split | 來源 | 用途 |
+|---|---|---|
+| **train** ~90% | M4 訓練歌手的非 val 歌曲 + VV 訓練 user 的非 val 來源錄音 | Stage 1 / Stage 2 訓練 |
+| **val** ~5% | M4 訓練歌手裡 hold out 2 首歌/人;VV 訓練 user 裡 hold out 5% 來源錄音 | 訓中監控 loss、挑 best ckpt |
+| **test** ~5% | M4 整位 hold-out 歌手(2 位);VV 整位 hold-out user(~10%) | Phase 3 推理評估,**訓練永不碰** |
+
+兩條重要原則:
+1. **以「歌手 / user_id」為單位 hold out test** —— 同人不可同時出現在 train / test,否則模型可能記 spk_emb 而非學泛化
+2. **val 用「整首歌 / 整個來源錄音」為單位** —— 同首歌不同 phrase 不可分到 train / val,否則 random crop 後等於洩漏
+
+#### 為什麼 seed 固定
+
+`--seed 42`(預設)→ 同種子在同 dataset 上**永遠產生相同切割**。`splits/report.json` 內含實際被 hold out 的歌手名單供 audit。
+
+#### dataset.py 如何使用 split 檔
+
+[`BinarizedNSVBDataset`](../nsvb/data/dataset.py) 接 `split_file` 參數,讀檔內 item_id list 把 `self.npz_paths` 過濾到只剩 list 內檔。`stage1.py` / `stage2.py` 預設找 `{binarized-root}/splits/{train,val}.txt`,有就用、無就 fallback 用全 dataset(印 warning)。
+
 ---
 
 ## 2. Phase 1 — Stage 1 CVAE 預訓練

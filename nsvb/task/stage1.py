@@ -135,6 +135,13 @@ class Stage1Config:
     save_interval: int = 5000
     grad_clip: float = 1.0
 
+    # ── Train/Val 切割(若 split_dir 下有 train.txt/val.txt 則啟用)──
+    # 為什麼放這裡而非強制必要:smoke test / 早期實驗有時想對全 dataset 跑;
+    # 預設指 splits/ 路徑,沒檔就 fallback 用全 dataset(印 warning)
+    split_dir: str = "data/binarized/splits"
+    val_interval: int = 1000      # 每 N 步算一次 val loss
+    val_max_batches: int = 50     # 每次 val 最多跑幾個 batch(~50 × 16 = 800 樣本足夠 stable)
+
     # ── 路徑 ──
     ckpt_dir: str = "checkpoints/stage1"
     init_from_nsvb: str = ""  # 若非空，從此 ckpt 路徑載入 NSVB FVAE 預訓練權重
@@ -153,17 +160,47 @@ class Stage1Trainer:
         self.device = torch.device(cfg.device)
         Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
-        # ── Dataset ──
-        sub_ds: List[BinarizedNSVBDataset] = []
+        # ── Dataset (train + optional val) ──
+        # 為什麼分 train/val:有 val loss 才挑得到「真正最佳」的 ckpt(不是 latest)、
+        # 也才看得到 overfit 跡象。split 檔由 scripts/make_splits.py 產生。
+        split_dir = Path(cfg.split_dir) if cfg.split_dir else None
+        train_split_file = None
+        val_split_file = None
+        if split_dir is not None:
+            t = split_dir / "train.txt"
+            v = split_dir / "val.txt"
+            if t.exists():
+                train_split_file = t
+                if v.exists():
+                    val_split_file = v
+                else:
+                    print(f"[stage1] {v} 不存在 — train 過濾啟用但無 val(不算 val loss)")
+            else:
+                print(f"[stage1] {t} 不存在 — fallback 用全 dataset(無 train/val 分離)")
+        else:
+            print(f"[stage1] cfg.split_dir 為空 — 用全 dataset(無 train/val 分離)")
+
+        train_ds: List[BinarizedNSVBDataset] = []
+        val_ds: List[BinarizedNSVBDataset] = []
         for ds_name in cfg.datasets:
             root = Path(cfg.binarized_root) / ds_name
             if not root.exists():
                 print(f"[stage1] WARNING: {root} not found, skipping")
                 continue
-            sub_ds.append(BinarizedNSVBDataset(root, max_frames=cfg.max_frames))
-        if not sub_ds:
-            raise RuntimeError("No dataset found; run binarizer.py first")
-        self.dataset = ConcatDataset(sub_ds)
+            train_ds.append(BinarizedNSVBDataset(
+                root, max_frames=cfg.max_frames, split_file=train_split_file,
+            ))
+            if val_split_file is not None:
+                try:
+                    val_ds.append(BinarizedNSVBDataset(
+                        root, max_frames=cfg.max_frames, split_file=val_split_file,
+                    ))
+                except FileNotFoundError as e:
+                    print(f"[stage1] val empty for {root.name}: {e}")
+        if not train_ds:
+            raise RuntimeError("No train dataset found; run binarizer.py first")
+        self.dataset = ConcatDataset(train_ds)
+        self.val_dataset = ConcatDataset(val_ds) if val_ds else None
 
         self.loader = DataLoader(
             self.dataset,
@@ -174,6 +211,21 @@ class Stage1Trainer:
             drop_last=True,
             pin_memory=(cfg.device == "cuda"),
         )
+
+        if self.val_dataset is not None and len(self.val_dataset) > 0:
+            self.val_loader = DataLoader(
+                self.val_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=False,         # val 固定順序便於對比
+                num_workers=cfg.num_workers,
+                collate_fn=collate_fn,
+                drop_last=False,
+                pin_memory=(cfg.device == "cuda"),
+            )
+            print(f"[stage1] val dataloader: {len(self.val_dataset)} samples")
+        else:
+            self.val_loader = None
+            print("[stage1] no val loader; best-ckpt selection disabled")
 
         # ── Model ──
         self.model = SVBVAEZh(
@@ -216,6 +268,8 @@ class Stage1Trainer:
 
         self.step = 0
         self.epoch = 0
+        # best val loss tracker(只在有 val_loader 時生效);best ckpt 用 val l1+l2 + kl 之和
+        self.best_val = float('inf')
         print(f"[stage1] init done: lr_g={effective_lr_g:.2e}, "
               f"d_mel={'on' if self.d_mel else 'off'}, "
               f"params(G)={sum(p.numel() for p in self.model.parameters())/1e6:.2f}M")
@@ -279,6 +333,53 @@ class Stage1Trainer:
             "l_d": d_loss_val,
         }
 
+    @torch.no_grad()
+    def val_step(self) -> dict:
+        """
+        對 val_loader 跑 val_max_batches 個 batch,回傳平均 val_l1/val_l2/val_kl/val_total。
+
+        為什麼跑固定 N batch 而非整個 val 集:
+          val 集 ~2K 樣本,每 batch 16 → ~125 batch;若每次都跑全部 = 整個訓練
+          loop 多花 ~10% 時間在 val。val_max_batches=50 → 800 樣本,對於 monitor
+          收斂趨勢已 statistically stable 夠;若想精算最終最佳 ckpt 再單獨跑全 val。
+
+        為什麼不算 D_mel adv loss:
+          D_mel 的 score 隨它自己訓練在飄,放進 val_total 會干擾 best-ckpt 判斷;
+          val_l1 + val_l2 + val_kl 是 G 的「重建品質 + 規則化」,直接反映 model 進展。
+        """
+        if self.val_loader is None:
+            return {}
+        self.model.eval()
+        if self.d_mel is not None:
+            self.d_mel.eval()
+
+        metrics = {"val_l1": 0.0, "val_l2": 0.0, "val_kl": 0.0}
+        n = 0
+        for batch in self.val_loader:
+            for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
+                batch[k] = batch[k].to(self.device, non_blocking=True)
+            out = self.model(batch["mel"], batch["ppg"], batch["f0"],
+                             batch["spk_emb"], batch["mel_mask"], infer=False)
+            mel_recon = out["mel_recon"]
+            kl = out["kl"]
+            l_l1 = masked_l1(mel_recon, batch["mel"], batch["mel_mask"])
+            l_l2 = masked_l2(mel_recon, batch["mel"], batch["mel_mask"])
+            metrics["val_l1"] += l_l1.item()
+            metrics["val_l2"] += l_l2.item()
+            metrics["val_kl"] += kl.item()
+            n += 1
+            if n >= self.cfg.val_max_batches:
+                break
+
+        self.model.train()
+        if self.d_mel is not None:
+            self.d_mel.train()
+
+        avg = {k: v / max(n, 1) for k, v in metrics.items()}
+        # val_total 用 l1+l2(不含 KL,因為 KL 在 warmup 期跳變,會誤判 best)
+        avg["val_total"] = avg["val_l1"] + avg["val_l2"]
+        return avg
+
     def save_ckpt(self, tag: str = "latest"):
         path = Path(self.cfg.ckpt_dir) / f"stage1_{tag}.pt"
         state = {
@@ -287,6 +388,9 @@ class Stage1Trainer:
             "model": self.model.state_dict(),
             "opt_g": self.opt_g.state_dict(),
             "config": self.cfg.__dict__,
+            # 為什麼存 best_val:resume 時要繼續維持「目前最佳」基準,
+            # 不然 resume 後第一個 val 一定變 best、會誤覆寫實際更好的 ckpt
+            "best_val": self.best_val,
         }
         if self.d_mel is not None:
             state["d_mel"] = self.d_mel.state_dict()
@@ -317,7 +421,9 @@ class Stage1Trainer:
                 self.opt_d.load_state_dict(state["opt_d"])
         self.step = int(state.get("step", 0))
         self.epoch = int(state.get("epoch", 0))
-        print(f"[stage1] resumed at step={self.step} epoch={self.epoch}", flush=True)
+        self.best_val = float(state.get("best_val", float('inf')))
+        print(f"[stage1] resumed at step={self.step} epoch={self.epoch} "
+              f"best_val={self.best_val:.4f}", flush=True)
 
     def fit(self):
         # tqdm 提供 ssh 也能看的 ASCII progress bar；
@@ -364,6 +470,21 @@ class Stage1Trainer:
                     self.save_ckpt(tag=f"step{self.step}")
                     self.save_ckpt(tag="latest")
 
+                # val + best-ckpt 追蹤
+                # 為什麼跟 save_interval 分開:val 比 ckpt save 該更頻繁(才看得到趨勢);
+                # save_interval 5000、val_interval 1000 → 每 ckpt 看 5 個 val 點
+                if (self.val_loader is not None
+                        and self.step % self.cfg.val_interval == 0):
+                    val_metrics = self.val_step()
+                    val_str = " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
+                    pbar.write(f"[val   step {self.step:6d}] {val_str}")
+                    val_total = val_metrics.get("val_total", float('inf'))
+                    if val_total < self.best_val:
+                        self.best_val = val_total
+                        self.save_ckpt(tag="best")
+                        pbar.write(f"[val   ] new best val_total={val_total:.4f}"
+                                   f" → saved stage1_best.pt")
+
                 if self.step >= self.cfg.max_steps:
                     break
 
@@ -394,6 +515,13 @@ def main():
     parser.add_argument("--resume", default="",
                         help="從現有 ckpt 路徑恢復訓練（model + optimizer + step）。"
                              "可用 'latest' 為簡寫，會自動找 {ckpt-dir}/stage1_latest.pt")
+    parser.add_argument("--split-dir", default="data/binarized/splits",
+                        help="train.txt/val.txt 所在目錄(scripts/make_splits.py 產出)。"
+                             "該目錄無 train.txt 時 fallback 用全 dataset")
+    parser.add_argument("--val-interval", type=int, default=1000,
+                        help="每 N 步算一次 val loss")
+    parser.add_argument("--val-max-batches", type=int, default=50,
+                        help="每次 val 最多跑幾個 batch(預設 50 ≈ 800 樣本)")
     args = parser.parse_args()
 
     cfg = Stage1Config(
@@ -407,6 +535,9 @@ def main():
         use_d_mel=not args.no_adv,
         ckpt_dir=args.ckpt_dir,
         init_from_nsvb=args.init_from_nsvb,
+        split_dir=args.split_dir,
+        val_interval=args.val_interval,
+        val_max_batches=args.val_max_batches,
     )
     trainer = Stage1Trainer(cfg)
 

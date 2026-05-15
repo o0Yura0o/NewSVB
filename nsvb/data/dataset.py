@@ -59,15 +59,40 @@ class BinarizedNSVBDataset(Dataset):
         binarized_root: Path,
         max_frames: int = 600,
         min_frames: int = 32,
+        split_file: Optional[Path] = None,
     ):
+        """
+        Args:
+            split_file:
+                若指定，從該檔讀 item_id list（一行一個，無 .npz 副檔名），
+                只保留 list 內的 .npz。檔內可混合多 dataset 的 item_id；
+                本 dataset 只匹配自己目錄下符合的（其他 dataset 的 item_id 自然不會被 glob 到）。
+                See scripts/make_splits.py。
+        """
         self.root = Path(binarized_root)
         self.max_frames = max_frames
         self.min_frames = min_frames
 
         # 為什麼用 sorted：跨平台 / 跨機器 dataset index 順序一致
-        self.npz_paths = sorted(self.root.glob("*.npz"))
-        if not self.npz_paths:
+        candidate_paths = sorted(self.root.glob("*.npz"))
+        if not candidate_paths:
             raise FileNotFoundError(f"No .npz under {self.root}")
+
+        # 為什麼用 set lookup 而非 list:~21K 檔 × ~21K split entries 的 O(N²) 會慢爆;
+        # set 是 O(1) per check
+        if split_file is not None:
+            split_path = Path(split_file)
+            with open(split_path) as f:
+                allowed = {line.strip() for line in f if line.strip()}
+            candidate_paths = [p for p in candidate_paths if p.stem in allowed]
+            if not candidate_paths:
+                raise FileNotFoundError(
+                    f"No .npz under {self.root} matched split file {split_path}; "
+                    f"確認 split 檔內含本 dataset 的 item_id"
+                )
+            print(f"[dataset] {self.root.name}: filtered to "
+                  f"{len(candidate_paths)} samples via {split_path.name}")
+        self.npz_paths = candidate_paths
 
         # 預讀每個樣本的 mel 長度（過濾過短的，給 sampler 用）
         # 為什麼預讀：DataLoader 啟動時就過濾，後續每個 batch 都不會踩到太短樣本
