@@ -318,8 +318,60 @@ class Stage1Trainer:
             l_total = l_total + self.cfg.lambda_adv_mel * l_adv
             adv_val = l_adv.item()
 
+        # ── DEBUG (TEMP):前 3 步詳細印 + 任何步非 finite 就停下並 dump 現場 ──
+        # 為什麼要這段:NSVB-ZH 在 step 0 → step 1 之間踩 NaN(forward 出 m_q=NaN),
+        # 排查到底是 (a) 輸入有 NaN/Inf,(b) m_q/logs_q 在 fvae 內溢位,
+        # 還是 (c) 某個 loss 變成 NaN/Inf 反傳把 weights 灌爛。
+        # 確診修好後這段可移除。
+        import math as _math
+        def _t_stats(t):
+            if not isinstance(t, torch.Tensor):
+                return f"(not tensor: {type(t).__name__})"
+            ff = torch.isfinite(t).float().mean().item()
+            if ff < 1.0:
+                return f"shape={tuple(t.shape)} finite_frac={ff:.3f} (NaN/Inf present!)"
+            return (f"shape={tuple(t.shape)} min={t.min().item():.3e} "
+                    f"max={t.max().item():.3e} mean={t.float().mean().item():.3e}")
+
+        _loss_scalars = {
+            "l_l1": l_l1.item(),
+            "l_l2": l_l2.item(),
+            "kl": kl.item() if isinstance(kl, torch.Tensor) else float(kl),
+            "l_adv_g": adv_val,
+            "l_total": l_total.item(),
+            "beta": beta,
+        }
+        _bad = [k for k, v in _loss_scalars.items() if not _math.isfinite(v)]
+
+        if self.step < 3 or _bad:
+            tag = "⚠ NON-FINITE" if _bad else "[debug]"
+            print(f"\n{tag} step={self.step}", flush=True)
+            print(f"  losses: {_loss_scalars}", flush=True)
+            for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
+                print(f"  input {k:8s}: {_t_stats(batch[k])}", flush=True)
+            for k in ("mel_recon", "m_q", "logs_q", "kl"):
+                if k in out:
+                    print(f"  model.{k:9s}: {_t_stats(out[k])}", flush=True)
+            if _bad:
+                raise RuntimeError(
+                    f"non-finite loss at step={self.step}: {_bad} — see dump above"
+                )
+
         self.opt_g.zero_grad()
         l_total.backward()
+        # DEBUG (TEMP):檢查 backward 後 gradient 是否有 NaN/Inf;
+        # 有的話 opt.step() 後 weights 就會壞,要在這裡攔下
+        if self.step < 3 or _bad:
+            _bad_grad_params = []
+            for name, p in self.model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    _bad_grad_params.append(name)
+            if _bad_grad_params:
+                print(f"⚠ NaN/Inf in gradient of {len(_bad_grad_params)} params at step={self.step}; "
+                      f"first few: {_bad_grad_params[:5]}", flush=True)
+                raise RuntimeError(f"non-finite gradient at step={self.step}")
+        # ── DEBUG END ──
+
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.grad_clip)
         self.opt_g.step()
 
