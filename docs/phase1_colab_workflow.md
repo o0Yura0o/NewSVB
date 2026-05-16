@@ -22,11 +22,10 @@ Phase 0 完成後本應傳到 Linux 訓練機跑 Phase 1/2（見 [deployment_lin
 
 | 檔案 | 位置 | 來源 |
 |---|---|---|
-| binarized v2 tars | `NSVB-ZH/data/binarized_v2/{m4singer,vocalverse}.tar.zst` | Phase 0 §6 + cluster_ppg 後打包上傳 |
-| v2 centroids | `NSVB-ZH/data/binarized_v2/ppg_kmeans_centroids.npy` | 同上 |
+| binarized v2(單一 tar,含 centroids)| `NSVB-ZH/data/binarized_v2/binarized_v2.tar.zst` (~95 GB) | Phase 0 §6 + cluster_ppg 後打包上傳;tar 內結構 `binarized/{m4singer,vocalverse,ppg_kmeans_centroids.npy}` |
 | NSVB pretrained CVAE | `nsvb_ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt` | Stage A §2.8 上傳 |
 | COMMIT_HASH.txt | `NSVB-ZH/COMMIT_HASH.txt` | 訓練用的 git commit |
-| `rclone` 設定 | 已配好 `GD2CLL` remote（[phase0 §1 rclone 段](phase0_colab_workflow.md)） | 一次性 |
+| `rclone.conf`(可選)| `NSVB-ZH/rclone.conf` | Phase 0 設定後備份 |
 
 ---
 
@@ -79,19 +78,21 @@ shutil.copy(TARGET, BACKUP)
 !apt-get install -y zstd > /dev/null
 !mkdir -p /content/local_binarized
 
-# 從 Drive tar 串流解壓到 local（~30-60 min；110GB 寫到本機 SSD）
-for ds in ['m4singer', 'vocalverse']:
-    print(f'--- extracting {ds} ---', flush=True)
-    !zstd -dc /content/drive/MyDrive/NSVB-ZH/data/binarized_v2/{ds}.tar.zst \
-        | tar -xf - -C /content/local_binarized --strip-components=1
-!cp /content/drive/MyDrive/NSVB-ZH/data/binarized_v2/ppg_kmeans_centroids.npy \
-    /content/local_binarized/
+# 從 Drive 上單一 tar 串流解壓到 local（~30-60 min；110 GB 寫到本機 SSD）
+# tar 內結構是 binarized/{m4singer,vocalverse,ppg_kmeans_centroids.npy}，
+# --strip-components=1 砍掉 binarized/ 前綴 → 三項直接落到 /content/local_binarized/
+!zstd -dc /content/drive/MyDrive/NSVB-ZH/data/binarized_v2/binarized_v2.tar.zst \
+    | tar -xf - -C /content/local_binarized --strip-components=1
+
+!ls /content/local_binarized   # 應看到 m4singer/  vocalverse/  ppg_kmeans_centroids.npy
 
 # sanity check
 !PYTHONPATH=. python scripts/verify_binarized.py \
     --root /content/local_binarized --dataset m4singer vocalverse
 # 預期：0 bad, phoneme_id 100% (cluster_ppg 已跑)
 ```
+
+> ⚠ A100 session 的 `/content` 磁碟 ~235 GB,扣掉 OS / pip ~30 GB,剩 ~200 GB → 解壓出 ~110 GB binarized 後還有 ~90 GB 餘裕給 ckpt + log。CPU session(磁碟較小)不適合做這步。
 
 ### 1.4 把 `data/binarized` symlink 指 local
 
