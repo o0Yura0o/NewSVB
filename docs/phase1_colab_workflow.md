@@ -74,25 +74,34 @@ shutil.copy(TARGET, BACKUP)
 
 ### 1.3 解壓 v2 binarized 到 local
 
+⚠ **不要直接用 `zstd -dc /content/drive/...` 餵 FUSE 路徑**(看似 stream,實際上 Drive FUSE 會把讀的檔在本機**自動 cache** ~95GB,加上解壓出來的 ~110GB,磁碟 ~235GB 直接爆 → 之前實測踩過)。
+
+**用 `rclone cat` 走 Drive API stream,完全不落本機**:
+
 ```python
 !apt-get install -y zstd > /dev/null
+!rm -rf /content/local_binarized
 !mkdir -p /content/local_binarized
 
-# 從 Drive 上單一 tar 串流解壓到 local（~30-60 min；110 GB 寫到本機 SSD）
-# tar 內結構是 binarized/{m4singer,vocalverse,ppg_kmeans_centroids.npy}，
+# rclone cat → zstd -dc → tar -xf  全程 pipe,沒有任何中間檔
+# 唯一落地的就是 /content/local_binarized/ 底下的 ~110 GB 解壓檔
+# tar 內結構是 binarized/{m4singer,vocalverse,ppg_kmeans_centroids.npy};
 # --strip-components=1 砍掉 binarized/ 前綴 → 三項直接落到 /content/local_binarized/
-!zstd -dc /content/drive/MyDrive/NSVB-ZH/data/binarized_v2/binarized_v2.tar.zst \
+!rclone cat GD2CLL:NSVB-ZH/data/binarized_v2/binarized_v2.tar.zst \
+    | zstd -dc \
     | tar -xf - -C /content/local_binarized --strip-components=1
 
 !ls /content/local_binarized   # 應看到 m4singer/  vocalverse/  ppg_kmeans_centroids.npy
+!df -h /content                # 應 ~140GB used(只有解壓檔 + OS,沒有 FUSE cache)
 
 # sanity check
+%cd /content/NSVB-ZH
 !PYTHONPATH=. python scripts/verify_binarized.py \
     --root /content/local_binarized --dataset m4singer vocalverse
-# 預期：0 bad, phoneme_id 100% (cluster_ppg 已跑)
+# 預期:0 bad, phoneme_id 100% (cluster_ppg 已跑)
 ```
 
-> ⚠ A100 session 的 `/content` 磁碟 ~235 GB,扣掉 OS / pip ~30 GB,剩 ~200 GB → 解壓出 ~110 GB binarized 後還有 ~90 GB 餘裕給 ckpt + log。CPU session(磁碟較小)不適合做這步。
+> 前提:§1.2.5 的 rclone install + config restore 已做完,`rclone listremotes` 看得到 `GD2CLL:`。
 
 ### 1.4 把 `data/binarized` symlink 指 local
 
