@@ -38,6 +38,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from nsvb.utils.audio_config import LATENT_DOWN_FACTOR
+
 
 class BinarizedNSVBDataset(Dataset):
     """
@@ -210,8 +212,16 @@ def collate_fn(batch: List[dict]) -> dict:
       phoneme_id:    pad -1
       mel_mask:      返回 [B, T_max]，1=valid, 0=pad（給 model / loss 用）
     """
-    # 計算 batch 內最長 T
-    T_max = max(s["mel"].shape[0] for s in batch)
+    # 計算 batch 內最長 T,並向上補到 LATENT_DOWN_FACTOR 的倍數
+    # 為什麼補:FVAE encoder 用 stride=4 Conv1d 下採樣 → T_z = floor((T-4)/4)+1;
+    # decoder upsample 用 stride=4 → 還原長度 = T_z * 4。
+    # 若 T_mel 不是 4 倍數,decoder 輸出長度比 mel_mask 短 3 個 frame,
+    # `x * x_mask` shape mismatch 整個 batch 報錯。
+    # 補 0-3 frame 到下一個 4 倍數;對應的 mel_mask 在補出來的 frame 為 0(視為 padding),
+    # loss 自動忽略 → 不影響訓練語義。
+    T_raw = max(s["mel"].shape[0] for s in batch)
+    pad_to = LATENT_DOWN_FACTOR
+    T_max = ((T_raw + pad_to - 1) // pad_to) * pad_to
     B = len(batch)
 
     # 為什麼用 zeros + 條件填 -1：
