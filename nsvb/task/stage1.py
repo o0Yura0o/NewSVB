@@ -495,6 +495,14 @@ class Stage1Trainer:
 
 # ── CLI ──────────────────────────────────────────────────
 def main():
+    # 為什麼 reconfigure line_buffering:
+    #   `python ... | tee log` 時 stdout 是 pipe(非 tty)→ Python 預設 block buffer
+    #   → init 階段(資料集預讀 ~15 min)的 print 全卡在 buffer 看不到,以為 hang。
+    #   line_buffering=True 每個換行就 flush,等同 -u 但不需使用者額外加 flag。
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description="NSVB-ZH Stage 1 CVAE pretrain")
     parser.add_argument("--binarized-root", default="data/binarized")
     parser.add_argument("--ppg-dim", type=int, default=1280,

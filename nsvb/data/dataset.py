@@ -96,10 +96,15 @@ class BinarizedNSVBDataset(Dataset):
 
         # 預讀每個樣本的 mel 長度（過濾過短的，給 sampler 用）
         # 為什麼預讀：DataLoader 啟動時就過濾，後續每個 batch 都不會踩到太短樣本
-        # 開銷：~10000 首歌 × np.load(allow_pickle=True) ~= 30 sec，一次性
+        # 開銷:~38K 檔(chunked dataset)× np.load ~10-30ms/檔 → ~10-15 min,一次性
+        # 為什麼加 progress print:這段沒進度時看起來像 hang(實際在掃檔),
+        # 每 2000 檔印一行讓 user 知道在動
+        n_total = len(self.npz_paths)
+        print(f"[dataset] {self.root.name}: pre-reading {n_total} .npz lengths "
+              f"(this scans every file once, may take a few minutes)...", flush=True)
         self._lengths = []
         valid_paths = []
-        for p in self.npz_paths:
+        for i, p in enumerate(self.npz_paths):
             try:
                 with np.load(p, allow_pickle=True) as data:
                     n = int(data["mel"].shape[0])
@@ -109,11 +114,15 @@ class BinarizedNSVBDataset(Dataset):
             except (KeyError, OSError, ValueError):
                 # 損壞 / 缺 mel key 的 .npz 跳過
                 continue
+            if (i + 1) % 2000 == 0:
+                print(f"[dataset] {self.root.name}: scanned "
+                      f"{i+1}/{n_total} (valid so far: {len(valid_paths)})",
+                      flush=True)
         self.npz_paths = valid_paths
 
         print(f"[dataset] {self.root.name}: {len(self.npz_paths)} valid samples "
               f"(mean T_mel={np.mean(self._lengths):.0f}, "
-              f"max={max(self._lengths)}, min={min(self._lengths)})")
+              f"max={max(self._lengths)}, min={min(self._lengths)})", flush=True)
 
     def __len__(self):
         return len(self.npz_paths)

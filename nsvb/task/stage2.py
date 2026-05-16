@@ -757,6 +757,12 @@ class Stage2Trainer:
 
 # ── CLI ──────────────────────────────────────────────────
 def main():
+    # 同 stage1:確保 stdout 在 pipe-to-tee 場景下 line-buffered,init 階段
+    # 預讀 dataset(~15 min)的 print 才不會卡在 buffer 看不到。
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description="NSVB-ZH Stage 2 mapping training")
     parser.add_argument("--binarized-root", default="data/binarized")
     parser.add_argument("--amateur-dataset", default="vocalverse")
