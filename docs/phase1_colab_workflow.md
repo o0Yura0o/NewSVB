@@ -105,12 +105,31 @@ shutil.copy(TARGET, BACKUP)
 
 ### 1.4 把 `data/binarized` symlink 指 local
 
+⚠ **跟 phase0 §3.5 衝突的處理**:§1.2 跑 phase0 §3.5 後,`data` 整個是個 **symlink 指向 Drive**(`data → /content/drive/MyDrive/NSVB-ZH/data/`),而 Drive 上又有真目錄 `binarized/`(舊 K=200 baseline)。直接 `rm -f data/binarized` 會被 OS 拒絕(`Is a directory`,`-f` 不等於 `-r`,擋下來是好事 —— 否則 `rm -rf` 會穿過 symlink 把 Drive 上的 K=200 baseline 真的刪掉)。
+
+正確做法:**拆掉 `data` 這個 symlink,在本地建 `data/` 目錄**,再讓 `data/binarized` 指 local 解壓檔:
+
 ```python
 %cd /content/NSVB-ZH
-!rm -f data/binarized
+
+# 1. 拆掉 data symlink(只刪 symlink 本身,不動 Drive 目標)
+#    [ -L path ] 測試是否為 symlink;是的話 unlink 掉
+!if [ -L data ]; then unlink data; echo "data symlink removed"; fi
+
+# 2. 建本地 data/,讓 binarized 指 local v2 解壓檔
+!mkdir -p data
+!rm -f data/binarized              # 防舊 binarized symlink 殘留
 !ln -sfn /content/local_binarized data/binarized
-!ls -la data/binarized
+
+# 3. 驗證
+!ls -la data/binarized             # binarized -> /content/local_binarized
+!ls data/binarized/                # m4singer/ vocalverse/ ppg_kmeans_centroids.npy
+                                    # (splits/ 要 §1.5 跑完後才會出現)
 ```
+
+**副作用**:`data` 從 symlink-to-Drive 變成本地真目錄後:
+- `data/binarized` → local ✅(Phase 1 訓練讀的)
+- `data/m4singer`(raw wav)、`data/VocalVerse`(raw wav) → 不再從 `data/...` 取得;Phase 1 訓練本來就不需要 raw wav,要用走絕對路徑 `/content/drive/MyDrive/NSVB-ZH/data/m4singer/...` 即可
 
 ### 1.5 切 train/val/test splits（**首次**訓練前跑一次,之後 session 也可重跑,seed 固定 → 結果相同）
 
