@@ -285,6 +285,31 @@ class Stage1Trainer:
         for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
             batch[k] = batch[k].to(self.device, non_blocking=True)
 
+        # ── DEBUG (TEMP):前 3 步在「model forward 之前」snapshot 輸入,
+        # 確認 NaN 是不是來自 dataset/collate(若是 → input scrub);
+        # 還是 model 後才出現(in-place 汙染 / model 內部產生)──
+        if self.step < 3:
+            print(f"\n[debug pre-forward] step={self.step}", flush=True)
+            for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
+                v = batch[k]
+                # 用 .sum().item() 取「精確整數計數」,不靠 float 平均的精度
+                n_nan = int(torch.isnan(v).sum().item())
+                n_inf = int(torch.isinf(v).sum().item())
+                if n_nan or n_inf:
+                    print(f"  ⚠ pre {k}: NaN={n_nan} Inf={n_inf} of {v.numel()}", flush=True)
+                    # 找出 batch 內哪些 sample 帶 NaN/Inf
+                    if v.ndim > 1:
+                        bad_mask = (~torch.isfinite(v)).flatten(start_dim=1).any(dim=1)
+                        bad_idx = bad_mask.nonzero().flatten().tolist()
+                        print(f"     bad samples in batch: {bad_idx}", flush=True)
+                        for s in bad_idx[:3]:
+                            item_id = batch["meta_item_id"][s] if "meta_item_id" in batch else "?"
+                            frames = (~torch.isfinite(v[s])).flatten().nonzero().flatten().tolist()[:5]
+                            print(f"     sample[{s}] item_id={item_id} first bad frames: {frames}", flush=True)
+                else:
+                    print(f"  pre {k}: ok shape={tuple(v.shape)} min={v.min().item():.3e} max={v.max().item():.3e}", flush=True)
+        # ── DEBUG END (pre-forward)──
+
         # ── (1) Update D_mel（如果啟用）──
         d_loss_val = 0.0
         if self.d_mel is not None and self.cfg.lambda_adv_mel > 0:
@@ -327,9 +352,12 @@ class Stage1Trainer:
         def _t_stats(t):
             if not isinstance(t, torch.Tensor):
                 return f"(not tensor: {type(t).__name__})"
-            ff = torch.isfinite(t).float().mean().item()
-            if ff < 1.0:
-                return f"shape={tuple(t.shape)} finite_frac={ff:.3f} (NaN/Inf present!)"
+            # 用 .sum().item() 取「精確整數計數」,避免 isfinite().float().mean() 的 fp 精度問題
+            n_nan = int(torch.isnan(t).sum().item())
+            n_inf = int(torch.isinf(t).sum().item())
+            if n_nan or n_inf:
+                return (f"shape={tuple(t.shape)} NaN={n_nan} Inf={n_inf} "
+                        f"finite={t.numel()-n_nan-n_inf}/{t.numel()}")
             return (f"shape={tuple(t.shape)} min={t.min().item():.3e} "
                     f"max={t.max().item():.3e} mean={t.float().mean().item():.3e}")
 
