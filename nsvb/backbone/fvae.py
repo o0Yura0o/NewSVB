@@ -224,6 +224,12 @@ class FVAEEncoder(nn.Module):
         x = self.wn(x, x_mask, g) * x_mask
         x = self.out_proj(x)
         m, logs = torch.split(x, self.latent_channels, dim=1)
+        # ── 數值安全:clamp logs 防 exp 溢位 ──
+        # 訓初(NSVB-ZH 新加的 condition layer 隨機 init)實測 logs 可飆到 ±55,
+        # exp(55) 直接溢位;z 抽樣的 exp(logs) 與下游 KL 的 exp(2*logs) 都會炸。
+        # [-10, 10] 對應 σ ∈ [4.5e-5, 22026],兩端都在 fp32 安全範圍;健康訓中
+        # logs 通常落 [-3, 3],clamp 只在病態 init 時生效,對訓練語義無影響。
+        logs = logs.clamp(min=-10.0, max=10.0)
         z = m + torch.randn_like(m) * torch.exp(logs)
         return z, m, logs, x_mask
 
@@ -350,6 +356,8 @@ class FVAE(nn.Module):
         """
         g_sqz = self.g_pre_net(g)
         if not infer:
+            # 注意:encoder 內已對 logs_q 做 clamp(±10)防 exp 溢位,
+            # 這裡 z_q 跟 logs_q 都已在安全範圍,KL 計算無需再 clamp
             z_q, m_q, logs_q, x_mask_sqz = self.encoder(x, x_mask, g_sqz)
             x_recon = self.decoder(z_q, x_mask, g)
 
