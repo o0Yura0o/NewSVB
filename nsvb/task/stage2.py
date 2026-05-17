@@ -228,10 +228,21 @@ class Stage2Config:
     delta_health_check_threshold: float = 0.03
 
 
-# ── 工具：兩 dataloader cycle ───────────────────────────
+# ── 工具：兩 dataloader 無限 yield ──────────────────────
 def infinite_loader(dl: DataLoader) -> Iterator[dict]:
-    """為什麼 cycle：一個 epoch 跑完還要繼續，最簡單就是 itertools.cycle。"""
-    return itertools.cycle(dl)
+    """無限 yield batches:dl 跑完一輪後回頭重 iterate。
+
+    ⚠ **不要**用 `itertools.cycle(dl)`:
+      cycle 會把每個 yield 出來的 batch 存進內部 saved list 供下一輪 replay。
+      我們在 train_step 用 `_to_device(batch)` **就地 mutate dict** 把 CPU
+      tensor 換成 GPU tensor → cycle 的 cache 變成「一堆指向 GPU tensor 的 dict」
+      → 每步累積 ~150MB GPU 不釋放,~200 步就把 40GB A100 吃光 OOM。
+
+    plain `yield from dl` 不 cache,generator stack frame 只留當前 batch 的
+    reference,前一個 batch 走出 stack 後 Python GC 即可回收 → 記憶體穩態。
+    """
+    while True:
+        yield from dl
 
 
 # ── Trainer ──────────────────────────────────────────────
