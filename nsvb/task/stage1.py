@@ -285,31 +285,6 @@ class Stage1Trainer:
         for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
             batch[k] = batch[k].to(self.device, non_blocking=True)
 
-        # ── DEBUG (TEMP):前 3 步在「model forward 之前」snapshot 輸入,
-        # 確認 NaN 是不是來自 dataset/collate(若是 → input scrub);
-        # 還是 model 後才出現(in-place 汙染 / model 內部產生)──
-        if self.step < 3:
-            print(f"\n[debug pre-forward] step={self.step}", flush=True)
-            for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
-                v = batch[k]
-                # 用 .sum().item() 取「精確整數計數」,不靠 float 平均的精度
-                n_nan = int(torch.isnan(v).sum().item())
-                n_inf = int(torch.isinf(v).sum().item())
-                if n_nan or n_inf:
-                    print(f"  ⚠ pre {k}: NaN={n_nan} Inf={n_inf} of {v.numel()}", flush=True)
-                    # 找出 batch 內哪些 sample 帶 NaN/Inf
-                    if v.ndim > 1:
-                        bad_mask = (~torch.isfinite(v)).flatten(start_dim=1).any(dim=1)
-                        bad_idx = bad_mask.nonzero().flatten().tolist()
-                        print(f"     bad samples in batch: {bad_idx}", flush=True)
-                        for s in bad_idx[:3]:
-                            item_id = batch["meta_item_id"][s] if "meta_item_id" in batch else "?"
-                            frames = (~torch.isfinite(v[s])).flatten().nonzero().flatten().tolist()[:5]
-                            print(f"     sample[{s}] item_id={item_id} first bad frames: {frames}", flush=True)
-                else:
-                    print(f"  pre {k}: ok shape={tuple(v.shape)} min={v.min().item():.3e} max={v.max().item():.3e}", flush=True)
-        # ── DEBUG END (pre-forward)──
-
         # ── (1) Update D_mel（如果啟用）──
         d_loss_val = 0.0
         if self.d_mel is not None and self.cfg.lambda_adv_mel > 0:
@@ -343,63 +318,8 @@ class Stage1Trainer:
             l_total = l_total + self.cfg.lambda_adv_mel * l_adv
             adv_val = l_adv.item()
 
-        # ── DEBUG (TEMP):前 3 步詳細印 + 任何步非 finite 就停下並 dump 現場 ──
-        # 為什麼要這段:NSVB-ZH 在 step 0 → step 1 之間踩 NaN(forward 出 m_q=NaN),
-        # 排查到底是 (a) 輸入有 NaN/Inf,(b) m_q/logs_q 在 fvae 內溢位,
-        # 還是 (c) 某個 loss 變成 NaN/Inf 反傳把 weights 灌爛。
-        # 確診修好後這段可移除。
-        import math as _math
-        def _t_stats(t):
-            if not isinstance(t, torch.Tensor):
-                return f"(not tensor: {type(t).__name__})"
-            # 用 .sum().item() 取「精確整數計數」,避免 isfinite().float().mean() 的 fp 精度問題
-            n_nan = int(torch.isnan(t).sum().item())
-            n_inf = int(torch.isinf(t).sum().item())
-            if n_nan or n_inf:
-                return (f"shape={tuple(t.shape)} NaN={n_nan} Inf={n_inf} "
-                        f"finite={t.numel()-n_nan-n_inf}/{t.numel()}")
-            return (f"shape={tuple(t.shape)} min={t.min().item():.3e} "
-                    f"max={t.max().item():.3e} mean={t.float().mean().item():.3e}")
-
-        _loss_scalars = {
-            "l_l1": l_l1.item(),
-            "l_l2": l_l2.item(),
-            "kl": kl.item() if isinstance(kl, torch.Tensor) else float(kl),
-            "l_adv_g": adv_val,
-            "l_total": l_total.item(),
-            "beta": beta,
-        }
-        _bad = [k for k, v in _loss_scalars.items() if not _math.isfinite(v)]
-
-        if self.step < 3 or _bad:
-            tag = "⚠ NON-FINITE" if _bad else "[debug]"
-            print(f"\n{tag} step={self.step}", flush=True)
-            print(f"  losses: {_loss_scalars}", flush=True)
-            for k in ["mel", "ppg", "f0", "spk_emb", "mel_mask"]:
-                print(f"  input {k:8s}: {_t_stats(batch[k])}", flush=True)
-            for k in ("mel_recon", "m_q", "logs_q", "kl"):
-                if k in out:
-                    print(f"  model.{k:9s}: {_t_stats(out[k])}", flush=True)
-            if _bad:
-                raise RuntimeError(
-                    f"non-finite loss at step={self.step}: {_bad} — see dump above"
-                )
-
         self.opt_g.zero_grad()
         l_total.backward()
-        # DEBUG (TEMP):檢查 backward 後 gradient 是否有 NaN/Inf;
-        # 有的話 opt.step() 後 weights 就會壞,要在這裡攔下
-        if self.step < 3 or _bad:
-            _bad_grad_params = []
-            for name, p in self.model.named_parameters():
-                if p.grad is not None and not torch.isfinite(p.grad).all():
-                    _bad_grad_params.append(name)
-            if _bad_grad_params:
-                print(f"⚠ NaN/Inf in gradient of {len(_bad_grad_params)} params at step={self.step}; "
-                      f"first few: {_bad_grad_params[:5]}", flush=True)
-                raise RuntimeError(f"non-finite gradient at step={self.step}")
-        # ── DEBUG END ──
-
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.grad_clip)
         self.opt_g.step()
 
