@@ -251,7 +251,7 @@ print(f'✅ ckpt sync started: {LOCAL_CKPT} → {DRIVE_CKPT} (every 120s)')
     --batch-size 16 \
     --max-steps 80000 \
     --num-workers 4 \
-    --init-from-nsvb /content/drive/MyDrive/nsvb_ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt \
+    --init-from-nsvb /content/drive/MyDrive/nsvb_ckpts/1030_vae_mle/model_ckpt_steps_200000.ckpt \
     --ckpt-dir /content/stage1_ckpts \
     --split-dir data/binarized/splits \
     --val-interval 1000 --val-max-batches 50 \
@@ -418,7 +418,7 @@ LOCAL_S2     = '/content/stage2_ckpts'
 DRIVE_S1     = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1'
 DRIVE_S2     = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage2_v2'
 DRIVE_LOGS   = '/content/drive/MyDrive/NSVB-ZH/logs_v2'
-NSVB_INIT    = '/content/drive/MyDrive/ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt'
+NSVB_INIT    = '/content/drive/MyDrive/ckpts/1030_vae_mle/model_ckpt_steps_200000.ckpt'
 
 # 0. 準備目錄(全部 Drive 路徑要先 mkdir 並 verify 是真目錄)
 for p in (LOCAL_S1, LOCAL_S2, DRIVE_S1, DRIVE_S2, DRIVE_LOGS):
