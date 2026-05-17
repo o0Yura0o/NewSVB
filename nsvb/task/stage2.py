@@ -175,6 +175,18 @@ class Stage2Config:
     #       若無法保證 dereverb，從一開始就建議啟此 flag
     dmel_mix_amateur_real: bool = False
 
+    # ── D_mel freeze（v2 redo:Risk §二.3 amateur F0 conditioning confound 救火）─
+    # 為什麼 freeze:fake mel decoder condition 用 f0_a(業餘),real mel 來自 pro,
+    #   → D_mel 容易用「f0_a 軌跡不像 pro」當捷徑判 fake,造成 l_adv_mel 結構性 floor,
+    #   M 為了縮這個 floor 改去動 latent 時間結構(觀察:Δ/z ~0.93、tdr ~0.77,
+    #   兩者都嚴重超出 training_flow §3.6.1 的健康範圍 [0.03, 0.30] / < 0.3)。
+    # 凍 D_mel + 把 λ_adv_mel 從 0.2 降到 0.05:把 mel 層 adversarial pressure 削弱
+    #   到只剩「prior signal」量級,M 主要從 PatchNCE + L_adv_z(latent space)學,
+    #   不再被 D_mel 的 F0 捷徑帶偏。
+    # 副作用:D_mel 不再更新,失去「跟隨 M 進步」的能力 → 訓練後期 D_mel 可能變弱;
+    #   但本次目標是「先讓 M 不亂改 latent」,自然度先暫時不靠 D_mel 推。
+    freeze_d_mel: bool = False
+
     # ── Optimizer (TTUR) ──
     lr_m: float = 1e-4
     lr_dz: float = 4e-4
@@ -338,16 +350,28 @@ class Stage2Trainer:
         self.opt_m = torch.optim.Adam(m_params, lr=cfg.lr_m, betas=(cfg.beta1, cfg.beta2))
         self.opt_dz = torch.optim.Adam(self.D_z.parameters(), lr=cfg.lr_dz,
                                         betas=(cfg.beta1, cfg.beta2))
-        self.opt_dmel = torch.optim.Adam(self.D_mel.parameters(), lr=cfg.lr_dmel,
-                                         betas=(cfg.beta1, cfg.beta2))
+        # freeze_d_mel:不建 opt_dmel 也把 D_mel param requires_grad 關掉(forward 仍可
+        # 跑、仍能對 M 提供 gradient,但本身 weight 不會被更新)
+        if cfg.freeze_d_mel:
+            for p in self.D_mel.parameters():
+                p.requires_grad = False
+            self.D_mel.eval()
+            self.opt_dmel = None
+        else:
+            self.opt_dmel = torch.optim.Adam(self.D_mel.parameters(), lr=cfg.lr_dmel,
+                                             betas=(cfg.beta1, cfg.beta2))
 
         self.step = 0
         n_m = sum(p.numel() for p in self.M.parameters()) / 1e6
         n_dz = sum(p.numel() for p in self.D_z.parameters()) / 1e6
         print(f"[stage2] init done: M={n_m:.2f}M, D_z={n_dz:.2f}M, "
-              f"lr(M/Dz/Dmel)={cfg.lr_m:.0e}/{cfg.lr_dz:.0e}/{cfg.lr_dmel:.0e}")
+              f"lr(M/Dz/Dmel)={cfg.lr_m:.0e}/{cfg.lr_dz:.0e}/"
+              f"{'frozen' if cfg.freeze_d_mel else f'{cfg.lr_dmel:.0e}'}")
+        print(f"[stage2] lambda(adv_z/adv_mel/patchnce)="
+              f"{cfg.lambda_adv_z}/{cfg.lambda_adv_mel}/{cfg.lambda_patchnce}", flush=True)
         print(f"[stage2] D_mel real source: "
-              f"{'pro+amateur (Risk 2 fallback)' if cfg.dmel_mix_amateur_real else 'pro only (default)'}",
+              f"{'pro+amateur (Risk 2 fallback)' if cfg.dmel_mix_amateur_real else 'pro only (default)'}"
+              f"{' [FROZEN]' if cfg.freeze_d_mel else ''}",
               flush=True)
 
     # ── 共用：把一個 batch 餵 frozen CVAE.encoder 拿 z 與下採條件 ─
@@ -421,8 +445,10 @@ class Stage2Trainer:
         self.opt_dz.step()
 
         # ── (2) Update D_mel (real = pro mel only by default) ──
+        # freeze_d_mel:整段 skip,既省 forward+backward 又省 update。D_mel 在 (3c) 仍會
+        # forward(以給 M 梯度),但 weight 凍住
         d_mel_loss_val = 0.0
-        if self.cfg.lambda_adv_mel > 0:
+        if self.cfg.lambda_adv_mel > 0 and not self.cfg.freeze_d_mel:
             with torch.no_grad():
                 z_a_mapped_for_mel = self.M(z_a)
                 fake_mel = self._decode_with_mapped_z(z_a_mapped_for_mel, ba)
@@ -533,7 +559,8 @@ class Stage2Trainer:
             "patchnce": self.patchnce.state_dict(),
             "opt_m": self.opt_m.state_dict(),
             "opt_dz": self.opt_dz.state_dict(),
-            "opt_dmel": self.opt_dmel.state_dict(),
+            # freeze_d_mel:opt_dmel = None,寫 None 不寫 dict
+            "opt_dmel": self.opt_dmel.state_dict() if self.opt_dmel is not None else None,
             "config": self.cfg.__dict__,
             "stage1_ckpt": self.cfg.stage1_ckpt,
         }
@@ -561,7 +588,10 @@ class Stage2Trainer:
             self.patchnce.load_state_dict(state["patchnce"], strict=True)
         self.opt_m.load_state_dict(state["opt_m"])
         self.opt_dz.load_state_dict(state["opt_dz"])
-        self.opt_dmel.load_state_dict(state["opt_dmel"])
+        # freeze_d_mel:本 run opt_dmel=None,跳過。若 ckpt 是非凍結時存的,opt_dmel
+        # state 仍會留在檔案內,本 run 不載入即可(D_mel weight 仍會被載)
+        if self.opt_dmel is not None and state.get("opt_dmel") is not None:
+            self.opt_dmel.load_state_dict(state["opt_dmel"])
         self.step = int(state.get("step", 0))
         print(f"[stage2] resumed at step={self.step}", flush=True)
 
@@ -812,6 +842,16 @@ def main():
                         help="Risk 2 fallback：D_mel real 改餵 pro+amateur 混合（預設只看 pro）。"
                              "訓中 monitor 顯示 unvoiced_concentration > 0.65 連續兩次時 resume + 啟此 flag 救火；"
                              "犧牲 mel 層 pro-direction 訊號換取「絕不鼓勵去殘響」的安全")
+    parser.add_argument("--freeze-d-mel", action="store_true",
+                        help="v2 redo:凍結 D_mel 不更新(forward 仍給 M 梯度)。"
+                             "目的:Risk §二.3 amateur F0 conditioning confound 救火 — "
+                             "Δ/z 0.93 + tdr 0.77 超出健康範圍時把 mel-side 對抗壓力削掉。"
+                             "搭配 --lambda-adv-mel 0.05 + --lr-dz 2e-4 使用")
+    parser.add_argument("--lambda-adv-mel", type=float, default=None,
+                        help="覆寫 Stage2Config.lambda_adv_mel(預設 0.2)。v2 redo 建議 0.05")
+    parser.add_argument("--lr-dz", type=float, default=None,
+                        help="覆寫 Stage2Config.lr_dz(預設 4e-4 = 4× lr_m,TTUR)。"
+                             "v2 redo 建議 2e-4(2× TTUR,削弱 latent 對抗壓力配合 D_mel freeze)")
     parser.add_argument("--resume", default="",
                         help="從現有 Stage 2 ckpt 路徑恢復（M/D_z/D_mel + 三 optimizer + step）。"
                              "可用 'latest' 簡寫，自動找 {ckpt-dir}/stage2_latest.pt")
@@ -820,7 +860,7 @@ def main():
                              "該目錄無 train.txt 時 fallback 用全 dataset")
     args = parser.parse_args()
 
-    cfg = Stage2Config(
+    cfg_kwargs = dict(
         binarized_root=args.binarized_root,
         amateur_dataset=args.amateur_dataset,
         pro_dataset=args.pro_dataset,
@@ -835,8 +875,14 @@ def main():
         ckpt_dir=args.ckpt_dir,
         m_kernel_size=args.m_kernel_size,
         dmel_mix_amateur_real=args.dmel_mix_amateur_real,
+        freeze_d_mel=args.freeze_d_mel,
         split_dir=args.split_dir,
     )
+    if args.lambda_adv_mel is not None:
+        cfg_kwargs["lambda_adv_mel"] = args.lambda_adv_mel
+    if args.lr_dz is not None:
+        cfg_kwargs["lr_dz"] = args.lr_dz
+    cfg = Stage2Config(**cfg_kwargs)
     trainer = Stage2Trainer(cfg)
 
     if args.resume:

@@ -160,24 +160,45 @@ shutil.copy(TARGET, BACKUP)
 
 訓練 ckpt 寫到 local SSD 才快（每幾千步存一次），背景 rsync 同步到 Drive 保證 session 斷掉時 ckpt 已落地。
 
+> 🔴 **重要 — `checkpoints/` 不要碰**(2026-05 事故教訓)
+>
+> phase0 §3.5 已把 `checkpoints` 整個目錄 symlink 到 Drive (`checkpoints -> /content/drive/MyDrive/NSVB-ZH/checkpoints/`)。早期版本的這個 cell 跑 `ln -sfn /content/stage1_ckpts checkpoints/stage1`,因為 `checkpoints` 是 symlink,這個指令實際上是在 **Drive 上**建立 symlink `/content/drive/MyDrive/NSVB-ZH/checkpoints/stage1 -> /content/stage1_ckpts`。然後 rsync `/content/stage1_ckpts/ → /content/drive/.../checkpoints/stage1/` 會跟著 symlink 走回 local,變成 local→local 的空 rsync,Drive 上**永遠不會有 ckpt 落地**。`[ckpt-sync] local=17 drive=17` 是假象,因為 `ls $DRIVE_CKPT` 也跟著 symlink 走回 local,數兩遍同一份。Session 一斷 local SSD 清空 → 整批訓練成果消失。
+>
+> 修正方法:**完全不走 `checkpoints/` 這個目錄**。
+> 1. 訓練 script 的 `--ckpt-dir` 直接指 local 絕對路徑 `/content/stage1_ckpts`(不要 `checkpoints/stage1`)。
+> 2. Drive 目的地用**新前綴** `checkpoints_v2/` —— 跟 phase0 §3.5 的 `checkpoints/` 不同名,完全不會被 symlink 鏈到。
+> 3. 同步前主動 verify Drive 端是真目錄,不是 symlink。
+
 ```python
 import os, time, subprocess, threading
+from pathlib import Path
 
-LOCAL_CKPT = '/content/stage1_ckpts'
-DRIVE_CKPT = '/content/drive/MyDrive/NSVB-ZH/checkpoints/stage1'
+LOCAL_CKPT = '/content/stage1_ckpts'                                       # local SSD,訓練實際寫入處
+DRIVE_CKPT = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1'        # ⚠ v2 前綴,避開 phase0 §3.5 symlink
 os.makedirs(LOCAL_CKPT, exist_ok=True)
 os.makedirs(DRIVE_CKPT, exist_ok=True)
 
-# 把 checkpoints/stage1 symlink 改指 local（覆蓋 §3.5 的 Drive 指向）
-%cd /content/NSVB-ZH
-!rm -rf checkpoints/stage1
-!mkdir -p checkpoints
-!ln -sfn /content/stage1_ckpts checkpoints/stage1
-!ls -la checkpoints/stage1
+# Verify:Drive 端必須是「真目錄,不是 symlink」,否則 rsync 會走回 local 形成空同步
+def verify_drive_real(path: str):
+    p = Path(path)
+    assert p.exists(), f"{path} 不存在"
+    assert not p.is_symlink(), (
+        f"{path} 是 symlink → rsync 會跟著走、Drive 上不會落檔。"
+        f"檢查 phase0 §3.5 是否把上層目錄 symlink 到別處,改用不同名稱前綴。"
+    )
+    assert p.is_dir(), f"{path} 不是目錄"
+    # 寫一個 sentinel 確認 rsync 之後在 Drive 端能看到
+    sentinel = p / '.write_test'
+    sentinel.write_text('ok')
+    assert sentinel.exists() and sentinel.read_text() == 'ok'
+    sentinel.unlink()
+    print(f"✅ {path} 是真目錄,寫入可達")
 
-# 背景 sync：每 120 秒 local → Drive
-# 為什麼 120s 而非 binarize 期間的 60s：ckpt 檔案大（~200-500 MB / 次）、寫入間隔長
-# （每 5000 步 ~ 數十分鐘）；過於頻繁的 rsync 反而浪費 Drive bandwidth
+verify_drive_real(DRIVE_CKPT)
+
+# 背景 sync:每 120 秒 local → Drive
+# 為什麼 120s 而非 binarize 期間的 60s:ckpt 檔案大(~200-500 MB / 次)、寫入間隔長
+# (每 5000 步 ~ 數十分鐘);過於頻繁的 rsync 反而浪費 Drive bandwidth
 _sync_stop = threading.Event()
 
 def ckpt_sync_loop():
@@ -193,8 +214,14 @@ def ckpt_sync_loop():
             drive_n = subprocess.check_output(
                 f'ls {DRIVE_CKPT}/*.pt 2>/dev/null | wc -l', shell=True,
             ).decode().strip()
+            # 額外印 Drive 端真實 byte 數(若被 symlink 騙回 local,這數字會跟 local 完全相等;
+            # 真同步時 Drive 大小應該滯後 local 一個 rsync 週期 ~ 等於或略小於 local)
+            drive_bytes = subprocess.check_output(
+                f'du -sb {DRIVE_CKPT} 2>/dev/null | cut -f1', shell=True,
+            ).decode().strip() or '0'
             print(f"[ckpt-sync {time.strftime('%H:%M:%S')}] "
-                  f"local={local_n}  drive={drive_n}", flush=True)
+                  f"local={local_n}  drive={drive_n}  drive_bytes={drive_bytes}",
+                  flush=True)
         except Exception as e:
             print(f"[ckpt-sync] {e}", flush=True)
         if _sync_stop.wait(timeout=120):
@@ -202,8 +229,10 @@ def ckpt_sync_loop():
 
 sync_thread = threading.Thread(target=ckpt_sync_loop, daemon=True)
 sync_thread.start()
-print('✅ ckpt sync started (local → Drive, every 120s)')
+print(f'✅ ckpt sync started: {LOCAL_CKPT} → {DRIVE_CKPT} (every 120s)')
 ```
+
+> 訓練 script 的 `--ckpt-dir` 改傳 `/content/stage1_ckpts`(絕對路徑),不再用 `checkpoints/stage1`。
 
 ---
 
@@ -223,11 +252,13 @@ print('✅ ckpt sync started (local → Drive, every 120s)')
     --max-steps 80000 \
     --num-workers 4 \
     --init-from-nsvb /content/drive/MyDrive/nsvb_ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt \
-    --ckpt-dir checkpoints/stage1 \
+    --ckpt-dir /content/stage1_ckpts \
     --split-dir data/binarized/splits \
     --val-interval 1000 --val-max-batches 50 \
     2>&1 | tee logs/stage1_$(date +%Y%m%d_%H%M%S).log
 ```
+
+> ⚠ `--ckpt-dir` 直接傳 local 絕對路徑 `/content/stage1_ckpts`,**不要寫 `checkpoints/stage1`** —— 後者會被 phase0 §3.5 的 `checkpoints/` symlink 鏈導到 Drive,造成 §2 rsync 走 symlink 變空同步(2026-05 事故根因)。
 
 Cell 會持續輸出訓練 log:
 - 每 `log_interval` 步(50)印一次 train loss / it/s
@@ -255,8 +286,10 @@ Session 斷掉重連後：
 ### 4.2 從 Drive 拉回最新 ckpt 到 local
 
 ```python
-# 把 Drive 上累積的 ckpt 拉回 local（覆蓋 §1.3 後尚未建立的 local 端 ckpts）
-!rsync -au /content/drive/MyDrive/NSVB-ZH/checkpoints/stage1/ /content/stage1_ckpts/
+# 把 Drive 上累積的 ckpt 拉回 local(覆蓋 §1.3 後尚未建立的 local 端 ckpts)
+# ⚠ 走 v2 路徑(§2 已說明原因)
+!mkdir -p /content/stage1_ckpts
+!rsync -au /content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1/ /content/stage1_ckpts/
 
 !ls -lh /content/stage1_ckpts/ | tail -10
 # 應看到 stage1_step{N}.pt 與 stage1_latest.pt
@@ -275,7 +308,7 @@ Session 斷掉重連後：
     --batch-size 16 \
     --max-steps 80000 \
     --num-workers 4 \
-    --ckpt-dir checkpoints/stage1 \
+    --ckpt-dir /content/stage1_ckpts \
     --resume latest \
     2>&1 | tee logs/stage1_resume_$(date +%Y%m%d_%H%M%S).log
 ```
@@ -334,16 +367,194 @@ _left = subprocess.run(['pgrep', '-a', 'rsync'],
 if _left:
     print('⚠ 仍有 rsync 程序:\n' + _left)
 
-# 強制最後一次 rsync 確保 Drive 完整
+# 強制最後一次 rsync 確保 Drive 完整(走 v2 路徑)
 subprocess.run(['rsync', '-au', '--info=stats2',
                 '/content/stage1_ckpts/',
-                '/content/drive/MyDrive/NSVB-ZH/checkpoints/stage1/'],
+                '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1/'],
                check=True)
-print('✅ Stage 1 ckpt 已完整落 Drive')
+print('✅ Stage 1 ckpt 已完整落 Drive (checkpoints_v2/stage1)')
 ```
 
 ### Phase 2 入口
-Stage 2 的 `--stage1-ckpt` 指向 Drive 上的 `stage1_final.pt`（或 `stage1_latest.pt`）。Phase 2 流程之後再寫（會類似這份但模型不同）。
+Stage 2 的 `--stage1-ckpt` 指向 Drive 上的 `stage1_best.pt`(走 v2 路徑:`/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1/stage1_best.pt`)。完整 Stage 2 流程見 §7(unattended mega-cell)。
+
+---
+
+## 7. Unattended overnight 訓練（Stage 1 → Stage 2 v2 一次跑完）
+
+跑這個 cell 之前 §1.1–§1.5 全部跑完(mount + 環境 + 解壓 binarized + splits)。**§2 不需要單跑**,本 cell 內已包含 sync 啟動。整個 cell 設計成放著睡覺,中間不需要介入:
+
+- Stage 1 (~3.5h on A100 @ 1.2it/s × 80K steps,首次 cold-start 略長;斷掉重連後本 cell 仍可重跑,會自動 `--resume latest` 接續)。
+- Stage 1 結束自動切到 Stage 2 **v2 config**(`freeze_d_mel + λ_adv_mel=0.05 + lr_dz=2e-4`)。
+- 全程 sync ckpt 到 Drive `checkpoints_v2/` (避開 phase0 §3.5 的 symlink 鏈)。
+- log tee 到 Drive,session 斷了也看得到。
+
+### v2 config 改了什麼、為什麼
+
+v1 訓練(已遺失)觀察到的問題:
+- `Δ/z ~0.93`、`temporal_diff_ratio ~0.77` 都遠超 [training_flow.md §3.6.1](training_flow.md) 的健康範圍(0.03–0.30 / < 0.3) → M 過度激進改 latent + 抹平時間軌跡。
+- `l_adv_mel ≈ 5` 卡在 floor 下不去 → [risk.md §二.3](../risk.md) 的 amateur F0 conditioning confound:fake mel 餵 `f0_a`(業餘 F0)、real mel 來自 pro,D_mel 用「F0 軌跡不像 pro」當捷徑判 fake,M 為縮這 floor 改去動 latent 時間結構。
+
+v2 對策:
+- **`--freeze-d-mel`**:凍 D_mel 不更新(D_mel forward 仍給 M 梯度,但本身 weight 不變),讓 mel 對抗壓力不再追著 M 跑。
+- **`--lambda-adv-mel 0.05`**(預設 0.2):把 mel 層 adversarial 權重從 main loss 同數量級降到 ~25% → mel 訊號當 prior,不主導 M。
+- **`--lr-dz 2e-4`**(預設 4e-4):TTUR 比率 4× → 2×,削弱 latent 層 D_z 對 M 的拉力。維持 D_z > M 的 TTUR 慣例(不打破),只是溫和點。
+- ⚠ **f0_support 想法評估後本次不加**:理論上對 §二.3 confound 是更根本的解(讓 fake/real mel decoder condition 都吃 smoothed F0,移除 D_mel 的 F0 捷徑),但本次先驗證「freeze + λ 降」是否足夠;若 v2 結果仍見 Δ/z > 0.5 或 tdr > 0.5,v3 再加 f0_support 並隔離變量。
+
+### 訓練 cell(複製整段下去執行,然後關 laptop 去睡)
+
+```python
+# ============================================================
+# Stage 1 → Stage 2 v2 unattended overnight 訓練
+# 前置:§1.1–§1.5 已跑完(mount + env + 解壓 binarized + splits)
+# Drive 目的地:checkpoints_v2/ (新前綴,避開 phase0 §3.5 symlink 鏈)
+# ============================================================
+import os, time, subprocess, threading, shlex
+from pathlib import Path
+
+REPO         = '/content/NSVB-ZH'
+LOCAL_S1     = '/content/stage1_ckpts'
+LOCAL_S2     = '/content/stage2_ckpts'
+DRIVE_S1     = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1'
+DRIVE_S2     = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage2_v2'
+DRIVE_LOGS   = '/content/drive/MyDrive/NSVB-ZH/logs_v2'
+NSVB_INIT    = '/content/drive/MyDrive/ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt'
+
+# 0. 準備目錄(全部 Drive 路徑要先 mkdir 並 verify 是真目錄)
+for p in (LOCAL_S1, LOCAL_S2, DRIVE_S1, DRIVE_S2, DRIVE_LOGS):
+    os.makedirs(p, exist_ok=True)
+
+def verify_drive_real(path: str):
+    p = Path(path)
+    assert p.exists() and not p.is_symlink() and p.is_dir(), (
+        f"{path} 不是真目錄(可能被 symlink 鏈到別處) → rsync 會走偏。"
+        f"避免用 `checkpoints/` 開頭,改用 `checkpoints_v2/`。"
+    )
+    sentinel = p / '.write_test'
+    sentinel.write_text('ok'); assert sentinel.read_text() == 'ok'; sentinel.unlink()
+
+for p in (DRIVE_S1, DRIVE_S2, DRIVE_LOGS):
+    verify_drive_real(p)
+print('✅ Drive 路徑 verify 通過')
+
+# 1. 背景 sync(stage1 → DRIVE_S1, stage2 → DRIVE_S2)
+_sync_stop = threading.Event()
+
+def _sync_pair(local: str, drive: str):
+    subprocess.run(['rsync', '-au', f'{local}/', f'{drive}/'], capture_output=True)
+
+def _count(path: str) -> str:
+    try:
+        return subprocess.check_output(
+            f'ls {path}/*.pt 2>/dev/null | wc -l', shell=True,
+        ).decode().strip()
+    except Exception:
+        return '?'
+
+def ckpt_sync_loop():
+    while not _sync_stop.is_set():
+        _sync_pair(LOCAL_S1, DRIVE_S1)
+        _sync_pair(LOCAL_S2, DRIVE_S2)
+        print(f"[ckpt-sync {time.strftime('%H:%M:%S')}] "
+              f"s1: local={_count(LOCAL_S1)} drive={_count(DRIVE_S1)}  "
+              f"s2: local={_count(LOCAL_S2)} drive={_count(DRIVE_S2)}",
+              flush=True)
+        if _sync_stop.wait(timeout=120):
+            break
+
+sync_thread = threading.Thread(target=ckpt_sync_loop, daemon=True)
+sync_thread.start()
+print('✅ ckpt sync started (every 120s, stage1+stage2 平行)')
+
+# 2. 從 Drive 拉回已有的 ckpt(idempotent,重連時自動接續)
+subprocess.run(['rsync', '-au', f'{DRIVE_S1}/', f'{LOCAL_S1}/'], check=False)
+subprocess.run(['rsync', '-au', f'{DRIVE_S2}/', f'{LOCAL_S2}/'], check=False)
+
+# 3. Stage 1:若 stage1_best.pt 不存在則訓練,否則 skip
+os.chdir(REPO)
+ts = time.strftime('%Y%m%d_%H%M%S')
+
+stage1_best = Path(LOCAL_S1) / 'stage1_best.pt'
+stage1_latest = Path(LOCAL_S1) / 'stage1_latest.pt'
+
+if stage1_best.exists():
+    print(f'⏭️  Stage 1 已完成: {stage1_best} 存在,skip Stage 1 直接跑 Stage 2')
+else:
+    resume_flag = '--resume latest' if stage1_latest.exists() else \
+                  f'--init-from-nsvb {shlex.quote(NSVB_INIT)}'
+    cmd = (
+        f'PYTHONPATH=. python -m nsvb.task.stage1 '
+        f'  --binarized-root data/binarized '
+        f'  --ppg-dim 1280 --batch-size 16 --num-workers 4 '
+        f'  --max-steps 80000 '
+        f'  --ckpt-dir {shlex.quote(LOCAL_S1)} '
+        f'  --split-dir data/binarized/splits '
+        f'  --val-interval 1000 --val-max-batches 50 '
+        f'  {resume_flag} '
+        f'2>&1 | tee {shlex.quote(f"{DRIVE_LOGS}/stage1_{ts}.log")}'
+    )
+    print(f'▶️  Stage 1 start ({"resume" if stage1_latest.exists() else "cold start"})')
+    rc = subprocess.call(cmd, shell=True)
+    if rc != 0:
+        print(f'❌ Stage 1 exit code {rc} → 停 sync,不繼續 Stage 2')
+        _sync_stop.set(); sync_thread.join(timeout=180)
+        raise SystemExit(rc)
+    # 最終確認 best 存在(stage1.py val loop 應該已產出)
+    assert stage1_best.exists(), f'Stage 1 跑完但 {stage1_best} 不存在 — 檢查 val_interval 設定'
+    # 確保 Stage 1 全部落 Drive 後再進 Stage 2(防 Stage 2 crash 帶走 Stage 1 還沒同步的 ckpt)
+    _sync_pair(LOCAL_S1, DRIVE_S1)
+    print(f'✅ Stage 1 done; {stage1_best.name} 已落 Drive')
+
+# 4. Stage 2 v2:freeze_d_mel + λ_adv_mel=0.05 + lr_dz=2e-4
+stage2_latest = Path(LOCAL_S2) / 'stage2_latest.pt'
+resume_flag2 = '--resume latest' if stage2_latest.exists() else ''
+cmd2 = (
+    f'PYTHONPATH=. python -m nsvb.task.stage2 '
+    f'  --binarized-root data/binarized '
+    f'  --ppg-dim 1280 --batch-size 16 --num-workers 4 '
+    f'  --max-steps 120000 '
+    f'  --stage1-ckpt {shlex.quote(str(stage1_best))} '
+    f'  --ckpt-dir {shlex.quote(LOCAL_S2)} '
+    f'  --split-dir data/binarized/splits '
+    f'  --freeze-d-mel --lambda-adv-mel 0.05 --lr-dz 2e-4 '
+    f'  {resume_flag2} '
+    f'2>&1 | tee {shlex.quote(f"{DRIVE_LOGS}/stage2_v2_{ts}.log")}'
+)
+print(f'▶️  Stage 2 v2 start ({"resume" if stage2_latest.exists() else "from scratch"})')
+print(f'    {cmd2}')
+rc2 = subprocess.call(cmd2, shell=True)
+print(f'Stage 2 exit code: {rc2}')
+
+# 5. 收尾:停 sync + 最終 rsync
+print('Stopping ckpt sync...')
+_sync_stop.set()
+while sync_thread.is_alive():
+    print('  等 ckpt sync 跑完當前這輪 rsync...')
+    sync_thread.join(timeout=30)
+print('  ckpt sync thread 已結束')
+
+subprocess.run(['rsync', '-au', '--info=stats2', f'{LOCAL_S1}/', f'{DRIVE_S1}/'], check=True)
+subprocess.run(['rsync', '-au', '--info=stats2', f'{LOCAL_S2}/', f'{DRIVE_S2}/'], check=True)
+print('✅ All ckpts 已完整落 Drive (checkpoints_v2/stage1 + checkpoints_v2/stage2_v2)')
+```
+
+### 醒來檢查清單
+
+1. 看 Drive `logs_v2/stage1_*.log` 末尾 → 應該到 step 80000 + `[val] new best ... saved stage1_best.pt`
+2. 看 Drive `logs_v2/stage2_v2_*.log` → 看 `Δ/z` / `temporal_diff_ratio` 收斂值
+   - 健康範圍:`Δ/z ∈ [0.03, 0.30]`,`tdr < 0.3`(v1 是 0.93 / 0.77)
+3. 看 Drive `checkpoints_v2/stage2_v2/stage2_step{N}.pt`(每 5000 步一個 + `stage2_latest.pt`)
+4. Listening test:`python scripts/stage2_ckpts_listening.py`(切到 v2 ckpt 路徑)
+
+### 預期時間
+
+| 階段 | 預估 |
+|---|---|
+| Stage 1 (80K steps @ ~1.2 it/s) | ~18-22h GPU |
+| Stage 2 v2 (120K steps @ ~2.0 it/s) | ~16-18h GPU |
+| 合計 wall clock | ~34-40h,需 1-2 次 session 重連 |
+
+若一次 session 沒跑完:重連後跑 §1.1–§1.5 + §7 整段 cell 即可,本 cell 設計 idempotent —— 自動偵測 stage1_best 存在 → 跳到 Stage 2;Stage 2 也自動 `--resume latest`。
 
 ---
 
