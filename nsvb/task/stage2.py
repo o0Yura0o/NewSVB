@@ -203,6 +203,12 @@ class Stage2Config:
     ckpt_dir: str = "checkpoints/stage2"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # ── Train split 過濾(避免 Stage 2 訓練吃到 hold-out test 樣本)──
+    # 為什麼只接 train.txt 不接 val.txt:Stage 2 是 GAN-style 對抗訓練,沒有單一
+    # 「val loss」是無爭議的最佳 ckpt 判準(D_z accuracy 漂、l_adv 是相對 score),
+    # 所以這裡只用 train split 排除 test。val/test 樣本留給推理 evaluation。
+    split_dir: str = "data/binarized/splits"
+
     # ── M 健康檢查（兩種 failure mode）─────────────────────
     # Failure mode A：M 太保守（delta_over_z 過低）— 學不出 pro-style 修飾
     # Failure mode B：M 抹平既有時間軌跡（temporal_diff_ratio 過高）— 顫音/滑音被殺
@@ -235,12 +241,23 @@ class Stage2Trainer:
         self.device = torch.device(cfg.device)
         Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
-        # ── Dataset：兩邊各自獨立 ──
+        # ── Dataset：兩邊各自獨立(若 splits/train.txt 存在則只吃 train 切分)──
+        split_dir = Path(cfg.split_dir) if cfg.split_dir else None
+        train_split_file = None
+        if split_dir is not None:
+            t = split_dir / "train.txt"
+            if t.exists():
+                train_split_file = t
+                print(f"[stage2] using train split: {t}")
+            else:
+                print(f"[stage2] {t} 不存在 — fallback 用全 dataset(test 樣本也會被訓到)")
         self.ds_a = BinarizedNSVBDataset(
-            Path(cfg.binarized_root) / cfg.amateur_dataset, max_frames=cfg.max_frames,
+            Path(cfg.binarized_root) / cfg.amateur_dataset,
+            max_frames=cfg.max_frames, split_file=train_split_file,
         )
         self.ds_p = BinarizedNSVBDataset(
-            Path(cfg.binarized_root) / cfg.pro_dataset, max_frames=cfg.max_frames,
+            Path(cfg.binarized_root) / cfg.pro_dataset,
+            max_frames=cfg.max_frames, split_file=train_split_file,
         )
         self.dl_a = DataLoader(
             self.ds_a, batch_size=cfg.batch_size, shuffle=True,
@@ -787,6 +804,9 @@ def main():
     parser.add_argument("--resume", default="",
                         help="從現有 Stage 2 ckpt 路徑恢復（M/D_z/D_mel + 三 optimizer + step）。"
                              "可用 'latest' 簡寫，自動找 {ckpt-dir}/stage2_latest.pt")
+    parser.add_argument("--split-dir", default="data/binarized/splits",
+                        help="train.txt 所在目錄(scripts/make_splits.py 產出)。"
+                             "該目錄無 train.txt 時 fallback 用全 dataset")
     args = parser.parse_args()
 
     cfg = Stage2Config(
@@ -804,6 +824,7 @@ def main():
         ckpt_dir=args.ckpt_dir,
         m_kernel_size=args.m_kernel_size,
         dmel_mix_amateur_real=args.dmel_mix_amateur_real,
+        split_dir=args.split_dir,
     )
     trainer = Stage2Trainer(cfg)
 
