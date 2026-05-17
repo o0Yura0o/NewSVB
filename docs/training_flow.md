@@ -257,15 +257,30 @@ LATENT_FRAME_RATE_HZ = 172.27 / 4  = 43.07 fps  (z, latent)
 
 ### 1.4 PPG k-means 分群（Phase 0 第二階段）
 
-**腳本**：`nsvb/data/cluster_ppg.py`，兩階段：
-1. **Stage A**：對所有 .npz 各抽 200 frames PPG → fit `MiniBatchKMeans(K=200)` → 存 centroids
-2. **Stage B**：對每個 .npz 用 centroids 算每 frame 的 phoneme_id → 寫回 .npz
+**腳本**：`nsvb/data/cluster_ppg.py`,兩階段:
+1. **Stage A**:對所有 .npz 各抽 `frames_per_song` frames PPG → fit `MiniBatchKMeans` → 存 centroids
+2. **Stage B**:對每個 .npz 用 centroids 算每 frame 的 phoneme_id → 寫回 .npz
 
-| 參數 | 值 | 為什麼 |
-|---|---|---|
-| K | 200 | 中文音素 ~80（不分聲調），但 Whisper hidden state 含 prosody/共發音/音高效應，K=200 給更純的 cluster |
-| frames per song | 200 | M4 21K snippets × 200 + VV 536 × 200 = ~4.3M frames，足以收斂 K=200 |
-| algorithm | MiniBatchKMeans | 全 frames ~250M 太大，stream batch 8192 fp32 |
+**最終 accept 的設定**(經 Gate ③/④ + 重 cluster 實驗驗證,詳見 [phase0_log.md](phase0_log.md) §3-§5):
+
+| 參數 | accepted | (initial baseline) | 為什麼 |
+|---|---|---|---|
+| K | **100** | (原 200) | K=200 + unpaired Mandarin → 嚴重 dataset-shortcut(M4 MI=0.862 / phoneme JSD=0.43);降到 100 + DC removal 後 MI=0.216 healthy / JSD=0.16 可接受 |
+| `--per-utt-mean-norm` | **on** | (原 off) | 每首歌 PPG 沿時間軸取均值並減掉,移除 Whisper layer 8 的 pitch DC 痕跡(Risk 2b 主防線);fit + assign 必須同 flag |
+| frames_per_song | **50** | (原 200) | 42K 檔 × 200 = 8.5M frames → np.concatenate 峰值 ~86 GB OOM;降到 50 ~2.1M frames、峰值 ~21 GB 安全;對 K=100 已遠超收斂需求 |
+| max_total_frames | 4,000,000 | (新增 cap) | 防 檔案數 × frames_per_song 失控,硬上限兜底 |
+| algorithm | MiniBatchKMeans | 同 | 全 frames ~250M 太大,stream batch 8192 fp32 |
+
+**accept 的 CLI 指令**:
+```bash
+python -m nsvb.data.cluster_ppg \
+    --binarized-root data/binarized \
+    --centroids-out data/binarized/ppg_kmeans_centroids.npy \
+    --k 100 --frames-per-song 50 --per-utt-mean-norm \
+    --stage all
+```
+
+⚠ **Stage 2 的 `--phoneme-vocab-size` 必須跟 K 一致**(現為 100;預設 200 會浪費 embedding 容量但仍可運作)。
 
 ### 1.5 Phase 0 監控與 gate
 
@@ -667,7 +682,11 @@ z, M(z) ─► proj head (Conv1d 128→64 → GELU → Conv1d 64→64) ─► [B
 **檔案**：`nsvb/task/stage2.py:Stage2Trainer.train_step`
 
 ```
-從兩個獨立 dataloader 各抽 batch (itertools.cycle)：
+# infinite_loader 是 `while True: yield from dl` 非快取 generator;
+# ⚠ 不用 itertools.cycle:cycle 會把 yield 過的 batch 全 cache 供 replay,
+# 而 _to_device 就地 mutate dict 把 CPU tensor 換成 GPU tensor →
+# cycle cache 變成「持續累積的 GPU tensor refs」→ ~200 步把 40GB A100 吃光 OOM。
+從兩個獨立 dataloader 各抽 batch:
   ba = next(iter_a)  # VocalVerse (amateur)
   bp = next(iter_p)  # M4Singer    (professional)
 
@@ -1025,6 +1044,77 @@ D_z(z, reg_z, ph_z)  [B, 1, T_z]           float32  per-frame logit
 D_mel(mel)           y: [B, 1]             float32  hinge score sum
 PatchNCE proj        [B, 64, T]            float32  query/key
 ```
+
+### 5.3 Condition input ↔ Phase 0 feature 對照表
+
+每個有 condition 輸入的模型 / loss 對應的 Phase 0 特徵來源。**業餘端來自 VocalVerse .npz、職業端來自 M4Singer .npz**;Phase 3 推理時來自使用者輸入 wav 走同 Phase 0 binarize pipeline 即時抽出。
+
+下標慣例:`_a` = amateur(VocalVerse),`_p` = professional(M4Singer),`_p_ref` = Mode B 的 pro 參考。
+
+#### 5.3.1 Stage 1(CVAE pretrain,m4 + vv 兩邊都當 real)
+
+| 模組 | Input(被建模)| Condition(Phase 0 feature)| Mask |
+|---|---|---|---|
+| FVAE encoder φ | `mel` | `ppg` + `f0` + `spk_emb` ← 三者由 `SVBVAEZh.condition` 拼成 g `[B,256,T]`(ppg→128 + log2 f0→32 + spk_emb→96 expanded)| `mel_mask` |
+| FVAE prior p(z) | - | N(0, I) 標準正態 | - |
+| FVAE decoder θ | `z`(來自 φ) | 同 encoder 的 g(`ppg` + `f0` + `spk_emb`)| `mel_mask` |
+| D_mel | `mel`(real)/ `mel_recon`(fake)| 無 | - |
+
+**Stage 1 不用 `register_*` 跟 `phoneme_id`**(這兩個是 Stage 2 D_z 才用);所以 Stage 1 啟動可以**不等 cluster_ppg 跑完**(dataset.py 對 phoneme_id 缺失回 -1 sentinel)。
+
+#### 5.3.2 Stage 2(Mapping training,φ + θ 從 Stage 1 ckpt 載入並凍結)
+
+| 模組 | Input | Condition(Phase 0 feature)| Mask |
+|---|---|---|---|
+| 凍結 φ(`_encode_and_downsample`,with no_grad,取 deterministic m_q)| `mel_a` 或 `mel_p` | `ppg_a/p` + `f0_a/p` + `spk_emb_a/p`(各自的)| `mel_mask` → 下採成 `mask_z` |
+| **ResidualM** | z (latent) | **無**(kernel=1 pointwise MLP,純動 z 不看任何條件) | - |
+| **D_z** | `z_a` / `z_p` 或 `M(z_a)` | **`register_soft` + `phoneme_id`** ← 下採到 z rate:`register_soft → linear interp [B,T_z,5]`,`phoneme_id → stride sample [B,T_z]` 再 embed 32 維 | `mask_z` |
+| 凍結 θ(`_decode_with_mapped_z`,用於 L_adv_mel)| `M(z_a)` | **`ppg_a` + `f0_a` + `spk_emb_a`(業餘端)** ⚠ | `mel_mask` |
+| D_mel | `mel_p`(real,只看 pro)/ `decode(M(z_a))`(fake)| 無 | - |
+| L_PatchNCE | `z_a` ↔ `M(z_a)`(proj head 128→64)| 無(batch-internal negatives)| `mask_z` |
+| L_id_pro(20% prob)| `z_p` ↔ `M(z_p)` | 無 | `mask_z` |
+
+⚠ **凍結 θ 在 `_decode_with_mapped_z` 用的是業餘端 condition**(不是 pro 端),理由是 Mode A 推理本就用業餘 F0;訓練端條件對齊推理 → train/test 一致。但**副作用**:D_mel real = pro mel(pro F0 生),`mel_g` 永遠帶業餘 F0 痕跡 → D_mel 可用「F0 不夠 pro」當捷徑判別 → `l_adv_mel` 有不可消地板。實測 step ~35K 看到 `l_adv_mel` 漸升 + `tdr` 漸升,正是這條 confound 在發生。詳 [risk.md §二.3](../risk.md)。
+
+#### 5.3.3 Phase 3 推理
+
+**Mode A**(預設,純自動,只吃使用者業餘音檔):
+
+| 子步驟 | Input | Condition | 備註 |
+|---|---|---|---|
+| 對使用者 wav 跑 Phase 0 pipeline | wav | - | 即時抽 mel_a / ppg_a / f0_a / spk_emb_a |
+| φ 編碼 → z_a → M(z_a) | mel_a | ppg_a + f0_a + spk_emb_a | encoder 走 cvae.condition |
+| θ 解碼 → mel_out | M(z_a) | **ppg_a + f0_a + spk_emb_a**(全業餘端,**包括 F0**) | F0 用業餘 = Mode A 設計 |
+| vocoder → wav_out | mel_out | f0_a(連續、unvoiced log-space 內插) | HifiGAN-NSF SineGen 需連續 F0 |
+
+**Mode B**(完全參考,需同首歌 pro 參考):
+
+| 子步驟 | Input | Condition | 備註 |
+|---|---|---|---|
+| 對 x_a 跑 Phase 0 pipeline | wav_a | - | 抽 mel_a / ppg_a / f0_a / spk_emb_a |
+| 對 x_p_ref 跑 Phase 0 pipeline | wav_p_ref | - | 抽 mel_p / ppg_p / f0_p_ref |
+| φ 編碼 → z_a → M(z_a) | mel_a | ppg_a + f0_a + spk_emb_a | 同 Mode A 前段 |
+| DTW alignment(a vs p_ref)| 兩首 PPG / mel | - | 算出 warp index `[T_p]` |
+| `torch.gather` warp z 到 p_ref 時間軸 | M(z_a) | warp index | M(z_a) 長度從 T_z_a 變 T_z_p |
+| θ 解碼 → mel_out | warped M(z_a) | **ppg_a/warped + f0_p_ref + spk_emb_a** ⚠ | F0 用 pro 參考、音色用業餘 |
+| vocoder → wav_out | mel_out | f0_p_ref(log-space 內插)| 輸出長度 = T_p,**無法配原伴奏** |
+
+⚠ Mode B 的 `spk_emb` 仍用業餘端(不是 pro 端歌手)→ **Risk 4 防護**(防音色被推到 pro 歌手身上)。Mode A 全部用業餘端是因為 unpaired 場景不可能有 pro 參考。
+
+#### 5.3.4 速查總表
+
+| Phase 0 feature | Stage 1 用? | Stage 2 用? | Phase 3 推理用? |
+|---|---|---|---|
+| `mel` | ✓ encoder input + reconstruct target | ✓ encoder input(zh) + D_mel real(pro)| ✓ encoder input |
+| `wav` | (vocoder Gate ① 用) | (Risk 2 monitor 拿來重抽 mel)| ✓ vocoder 端輸入也是;但訓練不用 |
+| `f0` | ✓ encoder + decoder condition | ✓ encoder + decoder(`_decode_with_mapped_z`)condition | ✓ encoder + decoder + vocoder |
+| `voicing` | (binarize 時用來決定 F0=0)| 同 | (用於 vocoder F0 內插) |
+| `ppg` | ✓ encoder + decoder condition | ✓ encoder + decoder condition | ✓ encoder + decoder condition |
+| `spk_emb` | ✓ encoder + decoder condition | ✓ encoder + decoder condition | ✓ encoder + decoder condition |
+| `register_soft` | ✗ 不用 | ✓ **D_z condition**(下採到 z rate)| ✗ 推理不用(D_z 訓練端才用) |
+| `register_id` | ✗ 不用 | (僅 JSD 統計用,訓練不用) | ✗ |
+| `phoneme_id` | ✗ 不用 | ✓ **D_z condition**(下採到 z rate,embed 32 維)| ✗ |
+| `meta_*` | (索引用) | (索引用) | (索引用) |
 
 ---
 
