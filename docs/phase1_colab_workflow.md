@@ -408,8 +408,9 @@ v2 對策:
 # Stage 1 → Stage 2 v2 unattended overnight 訓練
 # 前置:§1.1–§1.5 已跑完(mount + env + 解壓 binarized + splits)
 # Drive 目的地:checkpoints_v2/ (新前綴,避開 phase0 §3.5 symlink 鏈)
+# 輸出:訓練每一行 log 都即時印在 cell 下面(像 !cmd 那樣),同步 tee 到 Drive log file
 # ============================================================
-import os, time, subprocess, threading, shlex
+import os, sys, time, subprocess, threading
 from pathlib import Path
 
 REPO         = '/content/NSVB-ZH'
@@ -418,7 +419,7 @@ LOCAL_S2     = '/content/stage2_ckpts'
 DRIVE_S1     = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage1'
 DRIVE_S2     = '/content/drive/MyDrive/NSVB-ZH/checkpoints_v2/stage2_v2'
 DRIVE_LOGS   = '/content/drive/MyDrive/NSVB-ZH/logs_v2'
-NSVB_INIT    = '/content/drive/MyDrive/ckpts/1030_vae_mle/model_ckpt_steps_200000.ckpt'
+NSVB_INIT    = '/content/drive/MyDrive/nsvb_ckpts/nsvb_1030_vae_mle/model_ckpt_steps_200000.ckpt'
 
 # 0. 準備目錄(全部 Drive 路徑要先 mkdir 並 verify 是真目錄)
 for p in (LOCAL_S1, LOCAL_S2, DRIVE_S1, DRIVE_S2, DRIVE_LOGS):
@@ -436,6 +437,45 @@ def verify_drive_real(path: str):
 for p in (DRIVE_S1, DRIVE_S2, DRIVE_LOGS):
     verify_drive_real(p)
 print('✅ Drive 路徑 verify 通過')
+
+# ── 重要:streaming subprocess runner ─────────────────────────
+# 為什麼不用 `subprocess.call(... | tee logfile)`:雖然 stdout 會 inherit 到
+# notebook,但 shell pipeline 內的 tqdm/python print 走完整個 pipe buffer 才
+# flush,實測會卡好幾分鐘才出現一批,看起來像「training cell 沒輸出」(附錄 A 條目)。
+# 改用 Popen + 逐行 read + 主執行緒 print + 寫 log file → 即時 streaming + 落 Drive log。
+def stream_run(cmd_argv: list[str], log_path: str, env_extra: dict | None = None,
+               cwd: str | None = None) -> int:
+    """跑指令並把 stdout/stderr line-by-line 同時 print 到 notebook + 寫到 log_path。
+
+    Args:
+        cmd_argv: 不走 shell,直接 argv list(避免 quoting 地雷)。
+        log_path: log file 落地路徑(會即時 flush 一行就寫一行)。
+        env_extra: 額外環境變數(例如 PYTHONPATH)。
+        cwd: 子程序工作目錄。
+    Returns: exit code。
+    """
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    proc = subprocess.Popen(
+        cmd_argv,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        bufsize=1,                 # line-buffered(配合 python -u / line_buffering)
+        text=True, encoding='utf-8', errors='replace',
+        env=env, cwd=cwd,
+    )
+    try:
+        # log file 也 line-buffered(每行立即 flush 給 Drive sync 看到)
+        with open(log_path, 'a', buffering=1, encoding='utf-8') as logf:
+            logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} | {' '.join(cmd_argv)} ====\n")
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                logf.write(line)
+    finally:
+        rc = proc.wait()
+    return rc
 
 # 1. 背景 sync(stage1 → DRIVE_S1, stage2 → DRIVE_S2)
 _sync_stop = threading.Event()
@@ -480,26 +520,31 @@ stage1_latest = Path(LOCAL_S1) / 'stage1_latest.pt'
 if stage1_best.exists():
     print(f'⏭️  Stage 1 已完成: {stage1_best} 存在,skip Stage 1 直接跑 Stage 2')
 else:
-    resume_flag = '--resume latest' if stage1_latest.exists() else \
-                  f'--init-from-nsvb {shlex.quote(NSVB_INIT)}'
-    cmd = (
-        f'PYTHONPATH=. python -m nsvb.task.stage1 '
-        f'  --binarized-root data/binarized '
-        f'  --ppg-dim 1280 --batch-size 16 --num-workers 4 '
-        f'  --max-steps 80000 '
-        f'  --ckpt-dir {shlex.quote(LOCAL_S1)} '
-        f'  --split-dir data/binarized/splits '
-        f'  --val-interval 1000 --val-max-batches 50 '
-        f'  {resume_flag} '
-        f'2>&1 | tee {shlex.quote(f"{DRIVE_LOGS}/stage1_{ts}.log")}'
-    )
-    print(f'▶️  Stage 1 start ({"resume" if stage1_latest.exists() else "cold start"})')
-    rc = subprocess.call(cmd, shell=True)
+    # python -u:強制 unbuffered → tqdm + print 都即時吐到 Popen pipe(配合 stream_run 才能逐行印)
+    cmd1 = [
+        'python', '-u', '-m', 'nsvb.task.stage1',
+        '--binarized-root', 'data/binarized',
+        '--ppg-dim', '1280',
+        '--batch-size', '16',
+        '--num-workers', '4',
+        '--max-steps', '80000',
+        '--ckpt-dir', LOCAL_S1,
+        '--split-dir', 'data/binarized/splits',
+        '--val-interval', '1000', '--val-max-batches', '50',
+    ]
+    if stage1_latest.exists():
+        cmd1 += ['--resume', 'latest']
+        print('▶️  Stage 1 start (resume from local stage1_latest.pt)')
+    else:
+        cmd1 += ['--init-from-nsvb', NSVB_INIT]
+        print('▶️  Stage 1 start (cold start)')
+    log1 = f"{DRIVE_LOGS}/stage1_{ts}.log"
+    print(f'   log → {log1}')
+    rc = stream_run(cmd1, log_path=log1, env_extra={'PYTHONPATH': '.'}, cwd=REPO)
     if rc != 0:
         print(f'❌ Stage 1 exit code {rc} → 停 sync,不繼續 Stage 2')
         _sync_stop.set(); sync_thread.join(timeout=180)
         raise SystemExit(rc)
-    # 最終確認 best 存在(stage1.py val loop 應該已產出)
     assert stage1_best.exists(), f'Stage 1 跑完但 {stage1_best} 不存在 — 檢查 val_interval 設定'
     # 確保 Stage 1 全部落 Drive 後再進 Stage 2(防 Stage 2 crash 帶走 Stage 1 還沒同步的 ckpt)
     _sync_pair(LOCAL_S1, DRIVE_S1)
@@ -507,22 +552,28 @@ else:
 
 # 4. Stage 2 v2:freeze_d_mel + λ_adv_mel=0.05 + lr_dz=2e-4
 stage2_latest = Path(LOCAL_S2) / 'stage2_latest.pt'
-resume_flag2 = '--resume latest' if stage2_latest.exists() else ''
-cmd2 = (
-    f'PYTHONPATH=. python -m nsvb.task.stage2 '
-    f'  --binarized-root data/binarized '
-    f'  --ppg-dim 1280 --batch-size 16 --num-workers 4 '
-    f'  --max-steps 120000 '
-    f'  --stage1-ckpt {shlex.quote(str(stage1_best))} '
-    f'  --ckpt-dir {shlex.quote(LOCAL_S2)} '
-    f'  --split-dir data/binarized/splits '
-    f'  --freeze-d-mel --lambda-adv-mel 0.05 --lr-dz 2e-4 '
-    f'  {resume_flag2} '
-    f'2>&1 | tee {shlex.quote(f"{DRIVE_LOGS}/stage2_v2_{ts}.log")}'
-)
-print(f'▶️  Stage 2 v2 start ({"resume" if stage2_latest.exists() else "from scratch"})')
-print(f'    {cmd2}')
-rc2 = subprocess.call(cmd2, shell=True)
+cmd2 = [
+    'python', '-u', '-m', 'nsvb.task.stage2',
+    '--binarized-root', 'data/binarized',
+    '--ppg-dim', '1280',
+    '--batch-size', '16',
+    '--num-workers', '4',
+    '--max-steps', '120000',
+    '--stage1-ckpt', str(stage1_best),
+    '--ckpt-dir', LOCAL_S2,
+    '--split-dir', 'data/binarized/splits',
+    '--freeze-d-mel',
+    '--lambda-adv-mel', '0.05',
+    '--lr-dz', '2e-4',
+]
+if stage2_latest.exists():
+    cmd2 += ['--resume', 'latest']
+    print('▶️  Stage 2 v2 start (resume from local stage2_latest.pt)')
+else:
+    print('▶️  Stage 2 v2 start (from scratch)')
+log2 = f"{DRIVE_LOGS}/stage2_v2_{ts}.log"
+print(f'   log → {log2}')
+rc2 = stream_run(cmd2, log_path=log2, env_extra={'PYTHONPATH': '.'}, cwd=REPO)
 print(f'Stage 2 exit code: {rc2}')
 
 # 5. 收尾:停 sync + 最終 rsync
@@ -538,11 +589,22 @@ subprocess.run(['rsync', '-au', '--info=stats2', f'{LOCAL_S2}/', f'{DRIVE_S2}/']
 print('✅ All ckpts 已完整落 Drive (checkpoints_v2/stage1 + checkpoints_v2/stage2_v2)')
 ```
 
+> **為什麼這樣設計?**
+> 1. **`stream_run()` 用 `Popen` 逐行讀 + 同步寫 stdout/log_file**,避免 `subprocess.call("... | tee ...")` 在 shell pipeline 裡 tqdm 卡 buffer 不出來的問題(實測過,進度條會卡幾分鐘才現一次)。
+> 2. **`python -u`** 強制子程序 unbuffered stdout,配合 stage1/stage2.py 內已有的 `sys.stdout.reconfigure(line_buffering=True)`,每行 print 立即吐到 pipe。
+> 3. **argv list 不走 shell**:避免 quoting 地雷(路徑含空白、`&` 等)。
+> 4. **`log_path` 以 append mode 開**:resume 時不洗掉舊 log。同一 session 跑多次重連也累積得到完整訓練史。
+
 ### 醒來檢查清單
 
 1. 看 Drive `logs_v2/stage1_*.log` 末尾 → 應該到 step 80000 + `[val] new best ... saved stage1_best.pt`
-2. 看 Drive `logs_v2/stage2_v2_*.log` → 看 `Δ/z` / `temporal_diff_ratio` 收斂值
-   - 健康範圍:`Δ/z ∈ [0.03, 0.30]`,`tdr < 0.3`(v1 是 0.93 / 0.77)
+2. 看 Drive `logs_v2/stage2_v2_*.log` → 用 [`scripts/summarize_stage2_log.py`](../scripts/summarize_stage2_log.py) 生健康判定 summary:
+   ```bash
+   python scripts/summarize_stage2_log.py runs/stage2_v2_xxx.log
+   # → 同目錄產出 .summary.md,含整體判定 / milestone trajectory /
+   #   first-crossing 時間軸 / 末段穩態 / 音質監控
+   ```
+   健康範圍:`Δ/z ∈ [0.03, 0.30]`,`tdr < 0.3`。
 3. 看 Drive `checkpoints_v2/stage2_v2/stage2_step{N}.pt`(每 5000 步一個 + `stage2_latest.pt`)
 4. Listening test:`python scripts/stage2_ckpts_listening.py`(切到 v2 ckpt 路徑)
 
