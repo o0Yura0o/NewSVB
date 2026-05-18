@@ -175,6 +175,20 @@ class Stage2Config:
     #       若無法保證 dereverb，從一開始就建議啟此 flag
     dmel_mix_amateur_real: bool = False
 
+    # ── Plan B: f0_support(Risk §二.3 confound 根本解)──────
+    # 對 fake mel decoder 餵 smoothed F0,讓 D_mel 不能用「F0 jitter」當 amateur 簽名。
+    # 副作用:訓練時 decoder 看到 smoothed F0,跟 Mode A 推理(餵 raw F0)distribution
+    # 略有 shift。若要消除 shift,可考慮推理時也加 F0 平滑(--f0-smooth-method)
+    # 詳見 nsvb/data/f0_smoothing.py
+    f0_support_method: str = "none"     # "none" / "median" / "savgol"
+    f0_support_window: int = 5
+
+    # ── Plan D: pro-distribution matching loss ──────────────
+    # 額外 G loss:‖mean(mel_out) - pro_mean_env‖² 強制 batch envelope 朝 pro 走。
+    # pro_mean_env 在 trainer init 時從 train split 採樣 N 個 pro mel 平均算出。
+    lambda_pro_match: float = 0.0       # 0 = disabled(預設,v2 行為)
+    pro_match_n_samples: int = 200      # 算 pro_mean_env 時採樣 sample 數
+
     # ── D_mel freeze（v2 redo:Risk §二.3 amateur F0 conditioning confound 救火）─
     # 為什麼 freeze:fake mel decoder condition 用 f0_a(業餘),real mel 來自 pro,
     #   → D_mel 容易用「f0_a 軌跡不像 pro」當捷徑判 fake,造成 l_adv_mel 結構性 floor,
@@ -373,6 +387,53 @@ class Stage2Trainer:
               f"{'pro+amateur (Risk 2 fallback)' if cfg.dmel_mix_amateur_real else 'pro only (default)'}"
               f"{' [FROZEN]' if cfg.freeze_d_mel else ''}",
               flush=True)
+        if cfg.f0_support_method != "none":
+            print(f"[stage2] f0_support: {cfg.f0_support_method} window={cfg.f0_support_window}",
+                  flush=True)
+
+        # ── Plan D: pro_mean_env(訓開始時算一次,固定 reference)──
+        # 避免 test contamination:只從 train.txt 抽樣
+        self.pro_mean_env_t = None
+        if cfg.lambda_pro_match > 0:
+            self.pro_mean_env_t = self._compute_pro_mean_env_tensor()
+
+    def _compute_pro_mean_env_tensor(self) -> torch.Tensor:
+        """Plan D 用:從 train.txt 內的 pro samples 抽 N 筆算 mean envelope。
+
+        為什麼從 train.txt:val/test 留作驗收,不該用在訓中 reference。若 train.txt
+        不存在則 fallback 全 pro dataset(印 warning)。
+
+        Returns: [NUM_MELS] tensor on device,detached
+        """
+        import random as _random
+        from pathlib import Path as _Path
+        cfg = self.cfg
+        pro_dir = _Path(cfg.binarized_root) / cfg.pro_dataset
+        train_split = _Path(cfg.split_dir) / "train.txt"
+        if train_split.exists():
+            items = [s.strip() for s in train_split.read_text(encoding="utf-8").splitlines() if s.strip()]
+            candidates = [pro_dir / f"{item}.npz" for item in items]
+            candidates = [p for p in candidates if p.exists()]
+            print(f"[stage2] pro_mean_env: from train split {len(candidates)} pro samples",
+                  flush=True)
+        else:
+            candidates = sorted(pro_dir.glob("*.npz"))
+            print(f"[stage2] pro_mean_env: ⚠ train.txt 不存在,從全 pro dataset 抽 "
+                  f"{len(candidates)} samples(有 test contamination 風險)",
+                  flush=True)
+        if not candidates:
+            raise SystemExit(f"[stage2] pro_mean_env: 找不到 pro samples")
+        rng = _random.Random(42)
+        sampled = rng.sample(candidates, min(cfg.pro_match_n_samples, len(candidates)))
+        envs = []
+        for p in sampled:
+            with np.load(p, allow_pickle=True) as d:
+                mel = d["mel"].astype(np.float32)
+            envs.append(mel.mean(axis=0))                            # [NUM_MELS]
+        env = np.stack(envs).mean(axis=0).astype(np.float32)
+        print(f"[stage2] pro_mean_env computed (n={len(sampled)}, "
+              f"range=[{env.min():.2f}, {env.max():.2f}])", flush=True)
+        return torch.from_numpy(env).to(self.device)
 
     # ── 共用：把一個 batch 餵 frozen CVAE.encoder 拿 z 與下採條件 ─
     def _encode_and_downsample(self, batch: dict):
@@ -423,10 +484,25 @@ class Stage2Trainer:
             batch[k] = batch[k].to(self.device, non_blocking=True)
         return batch
 
+    def _maybe_smooth_f0_batch(self, batch: dict) -> dict:
+        """Plan B 用:回傳 batch 的 shallow copy,內 f0 換成 smoothed 版。
+        f0_support_method='none' 時直接回原 batch(無 overhead)。"""
+        if self.cfg.f0_support_method == "none":
+            return batch
+        from nsvb.data.f0_smoothing import smooth_f0_batch_torch
+        smoothed = smooth_f0_batch_torch(
+            batch["f0"],
+            method=self.cfg.f0_support_method,
+            window=self.cfg.f0_support_window,
+        )
+        return {**batch, "f0": smoothed}
+
     def train_step(self) -> dict:
         # ── 抽兩 batch ──
         ba = self._to_device(next(self.iter_a))
         bp = self._to_device(next(self.iter_p))
+        # Plan B: 若 f0_support 啟用,預平滑 amateur F0 給 fake-mel decode(只算一次)
+        ba_fake = self._maybe_smooth_f0_batch(ba)
 
         # ── 凍結 CVAE 拿 z + 下採條件 ──
         side_a = self._encode_and_downsample(ba)
@@ -451,7 +527,7 @@ class Stage2Trainer:
         if self.cfg.lambda_adv_mel > 0 and not self.cfg.freeze_d_mel:
             with torch.no_grad():
                 z_a_mapped_for_mel = self.M(z_a)
-                fake_mel = self._decode_with_mapped_z(z_a_mapped_for_mel, ba)
+                fake_mel = self._decode_with_mapped_z(z_a_mapped_for_mel, ba_fake)
             # Risk 2 fallback：若啟用 dmel_mix_amateur_real，real 餵 pro+amateur 混合；
             # 用 cat 一次餵進 D_mel 比餵兩次平均更穩（梯度尺度同步）
             if self.cfg.dmel_mix_amateur_real:
@@ -487,13 +563,30 @@ class Stage2Trainer:
 
         # 3c. L_adv_mel
         if self.cfg.lambda_adv_mel > 0:
-            mel_g = self._decode_with_mapped_z(z_a_mapped, ba)
+            mel_g = self._decode_with_mapped_z(z_a_mapped, ba_fake)
             mel_g_score = self.D_mel(mel_g)["y"]
             l_adv_mel = hinge_g_loss(mel_g_score)
             m_total = m_total + self.cfg.lambda_adv_mel * l_adv_mel
             m_loss_dict["l_adv_mel"] = l_adv_mel.item()
         else:
             m_loss_dict["l_adv_mel"] = 0.0
+
+        # 3e. Plan D: pro-distribution matching loss(把 mel_out envelope 拉向 pro)
+        # 為什麼用 envelope 而非 raw mel:不同 sample 長度不同沒法直接平均;
+        #   envelope (axis=0 reduction) 是 [NUM_MELS] 固定 shape,代表 spectral 重心。
+        # 為什麼 detach pro_mean_env:它是訓開始時算好的固定 reference,不要訓中漂。
+        if self.cfg.lambda_pro_match > 0 and self.pro_mean_env_t is not None:
+            # mel_g 從 3c 來;若 3c 沒跑(lambda_adv_mel=0)就重算一次
+            if self.cfg.lambda_adv_mel == 0:
+                mel_g = self._decode_with_mapped_z(z_a_mapped, ba_fake)
+            # mel_g: [B, T_mel, NUM_MELS];envelope per sample = mean over T → [B, NUM_MELS]
+            env_g = mel_g.mean(dim=1)                                # [B, NUM_MELS]
+            target = self.pro_mean_env_t.unsqueeze(0)                # [1, NUM_MELS]
+            l_pro_match = ((env_g - target) ** 2).mean()
+            m_total = m_total + self.cfg.lambda_pro_match * l_pro_match
+            m_loss_dict["l_pro_match"] = l_pro_match.item()
+        else:
+            m_loss_dict["l_pro_match"] = 0.0
 
         # 3d. L_identity_pro（隨機 20% 抽中）
         # 為什麼 stochastic 不是 bug（設計意圖）：
@@ -720,6 +813,11 @@ class Stage2Trainer:
         )
         print(f"[stage2] start training: device={self.device} "
               f"step={self.step}/{self.cfg.max_steps}", flush=True)
+        # v3 早停 hook(由 main() 透過 setattr 注入;沒注入則維持 None)
+        val_eval_hook = getattr(self, "val_eval_hook", None)
+        if val_eval_hook is not None:
+            print(f"[stage2] val_eval_hook attached: will eval every "
+                  f"{val_eval_hook.interval} steps", flush=True)
         t0 = time.time()
         running = {}
         last_logged_step = self.step
@@ -802,6 +900,18 @@ class Stage2Trainer:
                 self.save_ckpt(tag=f"step{self.step}")
                 self.save_ckpt(tag="latest")
 
+            # v3 早停 hook:每 N 步算 val mel-domain pro_direction_alignment,best 就存 ckpt
+            if val_eval_hook is not None and self.step % val_eval_hook.interval == 0:
+                hook_result = val_eval_hook(self.step)
+                pbar.write(
+                    f"[val-eval step {self.step}] pro_dir_align="
+                    f"{hook_result['val_pro_direction_alignment']:.4f}"
+                    + (f"  ⭐ new best → saved stage2_best.pt"
+                       if hook_result['is_best'] else
+                       f"  (best={hook_result['best_alignment']:.4f} @ step "
+                       f"{hook_result['best_step']})")
+                )
+
             # Risk 2 補強 P2：訓中音質監控
             if self.step % self.cfg.audio_quality_monitor_interval == 0:
                 self.monitor_audio_quality(
@@ -838,6 +948,10 @@ def main():
                         required=True)
     parser.add_argument("--ckpt-dir", default="checkpoints/stage2")
     parser.add_argument("--m-kernel-size", type=int, default=1, choices=[1, 3])
+    parser.add_argument("--m-hidden-dim", type=int, default=None,
+                        help="覆寫 Stage2Config.m_hidden_dim(預設 256)。Plan E 試 384 或 512")
+    parser.add_argument("--m-num-layers", type=int, default=None,
+                        help="覆寫 Stage2Config.m_num_layers(預設 4)。Plan E 試 6 或 8")
     parser.add_argument("--dmel-mix-amateur-real", action="store_true",
                         help="Risk 2 fallback：D_mel real 改餵 pro+amateur 混合（預設只看 pro）。"
                              "訓中 monitor 顯示 unvoiced_concentration > 0.65 連續兩次時 resume + 啟此 flag 救火；"
@@ -852,6 +966,38 @@ def main():
     parser.add_argument("--lr-dz", type=float, default=None,
                         help="覆寫 Stage2Config.lr_dz(預設 4e-4 = 4× lr_m,TTUR)。"
                              "v2 redo 建議 2e-4(2× TTUR,削弱 latent 對抗壓力配合 D_mel freeze)")
+    # Plan B: f0_support(Risk §二.3 根本解)
+    parser.add_argument("--f0-support", default="none", choices=["none", "median", "savgol"],
+                        help="Plan B:fake mel decode 餵 smoothed F0,讓 D_mel 不能用 F0 "
+                             "jitter 當 amateur 簽名。預設 none(v2 行為)")
+    parser.add_argument("--f0-support-window", type=int, default=5,
+                        help="F0 平滑窗口大小(frames,~5.8 ms each;預設 5 ≈ 30ms)")
+    # Plan D: pro-distribution matching
+    parser.add_argument("--lambda-pro-match", type=float, default=None,
+                        help="Plan D:‖mean(mel_out) - pro_mean_env‖² 權重。"
+                             "預設 0(disabled);建議 0.5~1.0 試")
+    parser.add_argument("--pro-match-n-samples", type=int, default=None,
+                        help="覆寫 pro_match_n_samples(預設 200,算 pro_mean_env 用)")
+    # v3 新增
+    parser.add_argument("--lambda-patchnce", type=float, default=None,
+                        help="覆寫 Stage2Config.lambda_patchnce(預設 1.0)。v3 建議 2.0"
+                             "(強化 content anchor,可能縮 generalization gap)")
+    parser.add_argument("--lambda-identity-pro", type=float, default=None,
+                        help="覆寫 Stage2Config.lambda_identity_pro(預設 0.1)。v3 建議 0.2"
+                             "(強化 M 對 pro 的 identity,間接限制 amateur 過修)")
+    parser.add_argument("--lambda-adv-z", type=float, default=None,
+                        help="覆寫 Stage2Config.lambda_adv_z(預設 1.0)")
+    parser.add_argument("--d-z-warmup-steps", type=int, default=None,
+                        help="覆寫 Stage2Config.d_z_warmup_steps(預設 5000)。v3 建議 10000"
+                             "(多給 PatchNCE 時間打底,避免 warmup 結束 M 失控)")
+    # 早停 hook 參數
+    parser.add_argument("--val-eval-interval", type=int, default=0,
+                        help="每 N 步在 val 上算 mel-domain pro_direction_alignment 並存"
+                             " stage2_best.pt。0=disabled(預設,維持舊行為)。v3 建議 5000")
+    parser.add_argument("--val-eval-n-samples", type=int, default=20,
+                        help="每次 val eval 取幾個 sample(預設 20,平衡時間 vs 統計穩定性)")
+    parser.add_argument("--val-eval-split-file", default=None,
+                        help="val split file 路徑;預設 {split-dir}/val.txt")
     parser.add_argument("--resume", default="",
                         help="從現有 Stage 2 ckpt 路徑恢復（M/D_z/D_mel + 三 optimizer + step）。"
                              "可用 'latest' 簡寫，自動找 {ckpt-dir}/stage2_latest.pt")
@@ -882,6 +1028,27 @@ def main():
         cfg_kwargs["lambda_adv_mel"] = args.lambda_adv_mel
     if args.lr_dz is not None:
         cfg_kwargs["lr_dz"] = args.lr_dz
+    if args.lambda_patchnce is not None:
+        cfg_kwargs["lambda_patchnce"] = args.lambda_patchnce
+    if args.lambda_identity_pro is not None:
+        cfg_kwargs["lambda_identity_pro"] = args.lambda_identity_pro
+    if args.lambda_adv_z is not None:
+        cfg_kwargs["lambda_adv_z"] = args.lambda_adv_z
+    if args.d_z_warmup_steps is not None:
+        cfg_kwargs["d_z_warmup_steps"] = args.d_z_warmup_steps
+    # Plan B
+    cfg_kwargs["f0_support_method"] = args.f0_support
+    cfg_kwargs["f0_support_window"] = args.f0_support_window
+    # Plan D
+    if args.lambda_pro_match is not None:
+        cfg_kwargs["lambda_pro_match"] = args.lambda_pro_match
+    if args.pro_match_n_samples is not None:
+        cfg_kwargs["pro_match_n_samples"] = args.pro_match_n_samples
+    # Plan E: M 架構
+    if args.m_hidden_dim is not None:
+        cfg_kwargs["m_hidden_dim"] = args.m_hidden_dim
+    if args.m_num_layers is not None:
+        cfg_kwargs["m_num_layers"] = args.m_num_layers
     cfg = Stage2Config(**cfg_kwargs)
     trainer = Stage2Trainer(cfg)
 
@@ -890,6 +1057,23 @@ def main():
         if resume_path == "latest":
             resume_path = str(Path(cfg.ckpt_dir) / "stage2_latest.pt")
         trainer.load_ckpt(resume_path)
+
+    # ── v3 早停 hook(可選)──
+    if args.val_eval_interval > 0:
+        from nsvb.task.stage2_eval_hook import Stage2BestCkptHook
+        val_split = args.val_eval_split_file or str(Path(args.split_dir) / "val.txt")
+        hook = Stage2BestCkptHook(
+            trainer=trainer,
+            binarized_root=Path(args.binarized_root),
+            val_split_file=Path(val_split),
+            pro_dataset=args.pro_dataset,
+            n_samples=args.val_eval_n_samples,
+            interval=args.val_eval_interval,
+            seed=42,
+        )
+        trainer.val_eval_hook = hook
+        print(f"[stage2] val eval hook enabled: every {args.val_eval_interval} steps, "
+              f"n_samples={args.val_eval_n_samples}, split={val_split}", flush=True)
 
     trainer.fit()
 

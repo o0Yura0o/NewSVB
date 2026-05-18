@@ -163,9 +163,18 @@ def _ensure_df_loaded():
 def dereverb_wav(
     wav: np.ndarray,
     sample_rate: int = SAMPLE_RATE,
+    backend: str = "df3",
 ) -> np.ndarray:
     """
-    用 DeepFilterNet3 對 wav 做去殘響 + 去噪。
+    對 wav 做去殘響 + 去噪。預設用 DeepFilterNet3,可切換 backend(Plan C 用)。
+
+    【backend 選項】
+    - `df3`        : DeepFilterNet3(預設),~10 MB,CPU/GPU,中文歌聲 dereverb 表現 OK
+    - `df3_cascade`: df3 跑兩次,更激進去殘響(可能引入 artifact,VV 重 reverb 才考慮)
+    - `demucs`     : (尚未實作)未來可接 Demucs htdemucs 提 vocals,跟 dereverb 不同概念
+    - `voicefixer` : (尚未實作)未來可接 VoiceFixer
+
+    新 backend 加進來時:在 `_BACKENDS` 註冊一個 callable 即可,不要動本函式 signature。
 
     為什麼這個前處理對 Risk 2 (錄音環境差異被誤學成「降噪濾波器」) 必要：
         VocalVerse (user-generated 業餘) 多帶手機/家庭錄音的殘響 + 背景噪聲；
@@ -201,10 +210,21 @@ def dereverb_wav(
     import torchaudio
     from df.enhance import enhance
 
+    if backend == "demucs":
+        raise NotImplementedError(
+            "demucs backend 尚未實作。Plan C 需要 agent 安裝 `pip install demucs` 後接"
+            " htdemucs 模型在這裡。改去 _dereverb_demucs() helper(未實作)。"
+        )
+    if backend == "voicefixer":
+        raise NotImplementedError(
+            "voicefixer backend 尚未實作。Plan C 需要 agent 安裝 `pip install voicefixer`"
+            " 後接 VoiceFixer 模型在這裡。"
+        )
+    if backend not in ("df3", "df3_cascade"):
+        raise ValueError(f"unknown dereverb backend: {backend!r}; "
+                         f"available: df3, df3_cascade, demucs(NI), voicefixer(NI)")
+
     model, df_state = _ensure_df_loaded()
-    # 為什麼 assert：_ensure_df_loaded 內部成功初始化後才 return；
-    # 但 type checker 看到 module-level _DF_MODEL/_DF_STATE 是 Optional 會抱怨
-    # asserts 給靜態檢查明確型別保證
     assert model is not None and df_state is not None
     df_sr = df_state.sr()  # 48000
 
@@ -212,7 +232,11 @@ def dereverb_wav(
     if sample_rate != df_sr:
         audio_t = torchaudio.functional.resample(audio_t, sample_rate, df_sr)
 
-    enhanced = enhance(model, df_state, audio_t)
+    # Plan C 內建選項:df3_cascade 跑兩次,適合 VV 端嚴重殘響
+    n_passes = 2 if backend == "df3_cascade" else 1
+    for _ in range(n_passes):
+        audio_t = enhance(model, df_state, audio_t)
+    enhanced = audio_t
 
     if sample_rate != df_sr:
         enhanced = torchaudio.functional.resample(enhanced, df_sr, sample_rate)
@@ -311,7 +335,9 @@ def pad_wav_to_mel_length(wav: np.ndarray, mel: np.ndarray) -> np.ndarray:
 
 
 # ── 一站式 pipeline ────────────────────────────────────
-def load_and_extract(path: str, dereverb: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+def load_and_extract(
+    path: str, dereverb: bool = True, dereverb_backend: str = "df3",
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Phase 0 binarizer 預設 entrypoint：
       1. load wav
@@ -336,7 +362,7 @@ def load_and_extract(path: str, dereverb: bool = True) -> Tuple[np.ndarray, np.n
     """
     wav = load_wav(path)
     if dereverb:
-        wav = dereverb_wav(wav)
+        wav = dereverb_wav(wav, backend=dereverb_backend)
     wav = loudness_normalize(wav)
     mel = compute_mel(wav)
     wav = pad_wav_to_mel_length(wav, mel)

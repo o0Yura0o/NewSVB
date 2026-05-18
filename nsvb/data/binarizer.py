@@ -227,18 +227,22 @@ class FeatureExtractors:
 
 
 def binarize_one(spec: SampleSpec, extractors: FeatureExtractors,
-                 dereverb: bool = True) -> dict:
+                 dereverb: bool = True, dereverb_backend: str = "df3") -> dict:
     """
     對一首歌做完整的特徵抽取，回傳可直接 np.savez 的 dict。
 
     Args:
         dereverb: 預設 True（production 必開, Risk 2 主防線）；smoke test 可關
+        dereverb_backend: 'df3' / 'df3_cascade' / 'demucs'(NI) / 'voicefixer'(NI)。
+                          Plan C 用,改 backend 等於改 audio 分布,需要對 M4 跟 VV 兩邊
+                          都重 binarize 才公平。
 
     Returns:
         sample dict，schema 見檔頭文件
     """
     # 1. 載入 + (optional) dereverb + loudness norm + mel
-    wav, mel = load_and_extract(spec.wav_path, dereverb=dereverb)
+    wav, mel = load_and_extract(spec.wav_path, dereverb=dereverb,
+                                dereverb_backend=dereverb_backend)
 
     # 2. 各種 feature
     feats = extractors.extract_all(wav, mel)
@@ -371,6 +375,7 @@ def run_binarize(
     device: Optional[str] = None,
     whisper_model_name: str = WHISPER_MODEL_NAME,
     dereverb: bool = True,
+    dereverb_backend: str = "df3",
     vocalverse_filter: Optional[FilterCriteria] = None,
     vocalverse_label_dir: Optional[Path] = None,
     vocalverse_chunk_sec: Optional[float] = None,
@@ -480,7 +485,8 @@ def run_binarize(
                     continue
 
         try:
-            sample = binarize_one(spec, extractors, dereverb=dereverb)
+            sample = binarize_one(spec, extractors, dereverb=dereverb,
+                                  dereverb_backend=dereverb_backend)
             if do_chunk:
                 chunks = chunk_sample(sample, vocalverse_chunk_sec)
                 if not chunks:
@@ -554,6 +560,14 @@ def main():
         "--no-dereverb", action="store_true",
         help="關閉 DeepFilterNet3 去殘響+去噪預處理。"
              "預設啟用（Risk 2 主防線；production 必開）；smoke test / 對照實驗才關",
+    )
+    parser.add_argument(
+        "--dereverb-backend", default="df3",
+        choices=["df3", "df3_cascade", "demucs", "voicefixer"],
+        help="Plan C:dereverb backend 選擇。預設 df3(NSVB-ZH 原版,M4 跟 VV 都跑)。"
+             "df3_cascade 跑兩次更激進去殘響(VV 重 reverb 才試);demucs / voicefixer 尚未"
+             "實作(agent 需要先 port 進 audio_io.dereverb_wav)。"
+             "改 backend 等於改 audio 分布,需要對 M4 跟 VV 兩邊都重 binarize 才公平。",
     )
     parser.add_argument(
         "--vocalverse-amateur-score-max", type=float, default=None,
@@ -652,6 +666,7 @@ def main():
         device=args.device,
         whisper_model_name=args.whisper_model,
         dereverb=not args.no_dereverb,
+        dereverb_backend=args.dereverb_backend,
         vocalverse_filter=vocalverse_filter,
         vocalverse_label_dir=Path(args.vocalverse_label_dir) if args.vocalverse_label_dir else None,
         vocalverse_chunk_sec=args.vocalverse_chunk_sec,
