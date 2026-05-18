@@ -198,26 +198,42 @@ def compute_metrics(mel_out: np.ndarray, mel_orig: np.ndarray,
 
 
 def compute_pro_mean_env(binarized_root: Path, pro_dataset: str, n: int,
-                         cache_path: Path, seed: int = 42) -> np.ndarray:
+                         cache_path: Path, seed: int = 42,
+                         split_file: Path = None) -> np.ndarray:
     """採樣 n 個 pro mel,算每首的 envelope(time-mean),再平均得到 pro mean env。
 
     為什麼 envelope 而不是 raw mel:不同 sample 長度不同,沒辦法直接平均 [T, NUM_MELS];
         envelope 是 [NUM_MELS] 固定 shape,且代表「該 sample 的 spectral 重心」,
         平均後得到 pro 群體的「典型 envelope」。
+
+    Args:
+        split_file: 可選,只從 split file 內 item_id 抽 pro_mean(避免 test 自己被
+                    含進 reference)。預設 None = 全 pro_dataset。
     """
     if cache_path.exists():
         cached = np.load(cache_path)
-        print(f"[pro_mean] cached envelope loaded from {cache_path} (n={cached.shape})")
+        print(f"[pro_mean] cached envelope loaded from {cache_path} (shape={cached.shape})")
         return cached
 
     pro_dir = binarized_root / pro_dataset
-    npz_files = sorted(pro_dir.glob("*.npz"))
+    if split_file is not None:
+        # 只取 split file 內列出的 pro samples(避免 test self-contamination)
+        items = [s.strip() for s in Path(split_file).read_text().splitlines() if s.strip()]
+        npz_files = [pro_dir / f"{item}.npz" for item in items]
+        npz_files = [p for p in npz_files if p.exists()]
+        print(f"[pro_mean] split-filtered ({split_file.name}): "
+              f"{len(npz_files)} pro samples available")
+    else:
+        npz_files = sorted(pro_dir.glob("*.npz"))
+        print(f"[pro_mean] using all {len(npz_files)} samples in {pro_dataset}/ "
+              f"(⚠ 含 test 樣本,有輕微 self-contamination)")
     if not npz_files:
-        raise SystemExit(f"no .npz in {pro_dir}")
+        raise SystemExit(f"no .npz available for pro_mean computation")
+
     rng = random.Random(seed)
     sampled = rng.sample(npz_files, min(n, len(npz_files)))
 
-    print(f"[pro_mean] computing envelope from {len(sampled)} pro samples in {pro_dataset}/")
+    print(f"[pro_mean] computing envelope from {len(sampled)} pro samples")
     envs = []
     for p in sampled:
         with np.load(p, allow_pickle=True) as d:
@@ -536,7 +552,13 @@ def main():
     ap.add_argument("--pro-dataset", default="m4singer", choices=["m4singer", "vocalverse"],
                     help="pro 端用哪個 dataset 算 mean envelope 參考(預設 m4singer)")
     ap.add_argument("--pro-mean-n", type=int, default=100,
-                    help="採樣多少 pro samples 算 pro mean envelope(預設 100)")
+                    help="採樣多少 pro samples 算 pro mean envelope。預設 100(spot check 夠);"
+                         "full test set eval 建議 500(SEM 從 ~10%% 降到 ~4.5%%)。"
+                         "再大效益遞減。")
+    ap.add_argument("--pro-split-file", default=None,
+                    help="只從這個 split file 內的 sample 抽 pro mean,避免 test 自己被含進"
+                         " reference(self-contamination)。預設:自動偵測 "
+                         "`{binarized_root}/splits/train.txt` 若存在則用。")
     ap.add_argument("--max-viz", type=int, default=20,
                     help="最多 render 幾個 sample 的 mel_grid.png(預設 20;全 test set"
                          " 跑時不會 render 4000 張)。設 0 全部不畫;設 -1 不限制。"
@@ -550,9 +572,18 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. pro mean envelope ──
+    # split_file 邏輯:用戶指定 > 自動偵測 train.txt > None(用全 dataset)
+    pro_split = Path(args.pro_split_file) if args.pro_split_file else None
+    if pro_split is None:
+        auto_train = Path(args.binarized_root) / "splits" / "train.txt"
+        if auto_train.exists():
+            pro_split = auto_train
+            print(f"[pro_mean] auto-using {pro_split} to avoid test contamination")
+    cache_tag = f"n{args.pro_mean_n}_{'train' if pro_split else 'all'}"
     pro_mean_env = compute_pro_mean_env(
         Path(args.binarized_root), args.pro_dataset, args.pro_mean_n,
-        cache_path=args.out_dir / "pro_mean_env.npy", seed=args.seed,
+        cache_path=args.out_dir / f"pro_mean_env_{cache_tag}.npy",
+        seed=args.seed, split_file=pro_split,
     )
 
     # ── 2. 取得每 sample 的 mels + f0 ──
