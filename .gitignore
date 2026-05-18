@@ -5,6 +5,10 @@
 /checkpoints/
 /runs/
 
+# COMMIT_HASH.txt 是「指向某個 commit 的指標」,應放在 repo 外(Drive share)由 agent
+# 在 setup 時下載。若 commit 進 repo,會產生雞生蛋邏輯(指向 commit X 的 file 在 commit X 內)
+COMMIT_HASH.txt
+
 # Python
 __pycache__/
 *.py[cod]
