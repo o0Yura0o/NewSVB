@@ -304,8 +304,21 @@ python -m nsvb.data.cluster_ppg \
 > NSVB 原版 vocoder 訓練時 `loud_norm: false`，但 NSVB-ZH binarize 為 Risk 2（響度對齊）預設啟用 BS.1770 -22 LUFS；兩跑都要 PASS 才能保證訓練 / 推理 mel 與 vocoder 兼容。
 
 **目前實測**（A. raw wav，pyworld + interp）：
-- SSIM = 0.94, F0 RMSE = 5.8 Hz → **PASS** ✅
+- M4Singer:SSIM = 0.94, F0 RMSE = 5.8 Hz → **PASS** ✅
+- VocalVerse:**Phase 0 沒單獨跑**,後來 Phase 2 補測發現 SSIM = 0.65, F0 RMSE = 53 Hz → **FAIL** ❌(見下方 caveat)
 - B（loud-normed）：尚未跑 — 部署到 Linux GPU 機器後第一件事
+
+> ⚠ **Phase 0 Gate ① 覆蓋不足（2026-05 post-Phase-2 發現)**:當初 Gate ① 只對 M4 跑,
+> 沒對 VV 單獨檢測。Phase 2 聽測時發現 amateur 端 wav 有電音,用
+> [`scripts/diagnose_stage1_vocoder_path.py`](../scripts/diagnose_stage1_vocoder_path.py)
+> 補測得到 VV 在 vocoder(GT mel) 路徑就已 SSIM = 0.65 / F0 RMSE = 53 Hz **大幅 fail**。
+> 這不影響 Stage 1/2 訓練本身(mel-domain),但 Phase 3 部署前必須先 vocoder
+> fine-tune on Chinese amateur。詳見 [risk.md Risk 10](../risk.md#risk-10vocoder-對-amateur-中文歌聲分布不熟新發現)
+> 與 [phase2_outcome.md](phase2_outcome.md)。
+>
+> **未來重做 Phase 0 的人**:Gate ① 一定要 **對每個 dataset 個別跑**,不能只用平均
+> verdict。`scripts/vocoder_identity_test.py --wav-dirs` 已支援多 dir,但 Phase 0
+> 沒用全。
 
 #### Gate ②：Audio quality probe（Risk 2 L4）
 

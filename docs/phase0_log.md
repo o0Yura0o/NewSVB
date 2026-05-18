@@ -169,12 +169,36 @@ VocalVerse:
 
 | Gate | 門檻 | 實測 | 狀態 |
 |---|---|---|---|
-| ① Vocoder identity | SSIM ≥ 0.90 / F0 RMSE ≤ 10 Hz | PASS | ✅ |
+| ① Vocoder identity (M4) | SSIM ≥ 0.90 / F0 RMSE ≤ 10 Hz | SSIM 0.94 / RMSE 5.8 Hz | ✅ |
+| ① Vocoder identity (VV) | SSIM ≥ 0.90 / F0 RMSE ≤ 10 Hz | **未跑** → Phase 2 補測 0.65 / 53 Hz | ❌ **retrospective FAIL**(見下文) |
 | ② Audio quality(reliable)| sfm/hf_ratio JSD 改善 | hf_ratio JSD 0.258 → 0.048 (PASS) | ✅ |
 | ③ JSD(phoneme)| < 0.05 | 0.1562 | ⚠️ 接受(理由見 §5)|
 | ③ JSD(register)| < 0.05 | 0.0838 | ⚠️ 接受(輕微,屬資料本性)|
 | ④ MI(phoneme; register)| < 0.3 bit | M4 0.216 / VV 0.058 | ✅ |
 | ④ mean voiced dwell | ≥ 8 frames | M4 8.6 / VV 7.5 marginal | ✅ / ⚠️ |
+
+### Retrospective: Gate ① VV 覆蓋不足(2026-05 Phase 2 後發現)
+
+Phase 0 跑 vocoder identity test 時只 verdict M4Singer(20 首) PASS,**沒看 VV
+單獨表現**。Stage 2 v2 訓完聽測發現 amateur 端 wav 有電音,用
+[`scripts/diagnose_stage1_vocoder_path.py`](../scripts/diagnose_stage1_vocoder_path.py)
+補測 VV 端 6 個 val sample,得到:
+
+| | SSIM(vocoder on GT mel) | F0 RMSE |
+|---|---:|---:|
+| M4 (pro) | 0.873 | 9.5 Hz |
+| VV (amateur) | **0.652** | **53.3 Hz** |
+
+VV 端 SSIM 大幅低於 0.85 門檻(Phase 0 gate fail 標準),F0 RMSE 是 PASS 上限的 5×。
+原因:NSVB pretrained `1012_hifigan_all_songs_nsf` 用英文 pop singing 訓練,中文
+amateur 分布不熟。
+
+**這不影響 Phase 0 / Phase 1 / Phase 2 訓練本身的判定**(訓練是 mel-domain 任務,
+不經 vocoder),但 **Phase 3 部署前必須 vocoder fine-tune on Chinese amateur**。
+詳見 [risk.md Risk 10](../risk.md) + [phase2_outcome.md](phase2_outcome.md)。
+
+**未來重做 Phase 0 的人請注意**:Gate ① 一定要 `--wav-dirs m4=... vocalverse=...`
+**對每個 dataset 個別 verdict**,平均 verdict 會掩蓋分布差異。
 
 ---
 

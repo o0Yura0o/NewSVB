@@ -90,6 +90,43 @@
   - 33 個 singer 全保留，per-singer 中位 17 樣本（min ~12），speaker diversity 不受損
   - kept amateur_score 範圍 [1.0, 3.0]，mean 2.40，明確「技術偏弱」區間
 
+### Risk 10：Vocoder 對 amateur 中文歌聲分布不熟（新發現,Phase 2 後）
+- **發現脈絡**:Stage 2 v2 訓練結束聽測時 amateur 端 `_1_stage1_recon.wav` 有電音、
+  M4 (pro) 端沒有。原本懷疑 Stage 1 對 amateur 重建有 bug,跑
+  [`scripts/diagnose_stage1_vocoder_path.py`](scripts/diagnose_stage1_vocoder_path.py)
+  隔離 mel vs vocoder path,得到:
+  | dataset | SSIM(vocoder on GT mel) | F0 RMSE(GT) |
+  |---|---:|---:|
+  | M4 (pro) | 0.873 ⚠ | 9.5 Hz ✅ |
+  | VV (amateur) | **0.652** ❌ | **53.3 Hz** ❌❌ |
+  即使餵**完全乾淨的 GT amateur mel**,vocoder 輸出 SSIM 已是 fail (< 0.85),且 F0 平均
+  錯約半個八度。是 vocoder 端問題,跟 Stage 1 / Stage 2 都無關。
+- **根因**:NSVB pretrained `1012_hifigan_all_songs_nsf` 在英文 pop singing
+  (PopBuTFy 類資料) 訓練,中文 amateur 歌聲的 mel 分布(更多氣聲、更廣 dynamic
+  range、更不規則 F0 軌跡) 不在訓練分布內 → SineGen 找不到 pitch lock → 高頻 jitter
+  變電音 artifact。
+- **對 Stage 2 v2 訓練的影響**:**無**。Stage 2 訓練是 mel-domain 任務,
+  [stage2_mel_eval.py](scripts/stage2_mel_eval.py) 兩階段驗證(val n=6 + test n=3773)
+  都顯示 v2 健康:
+  - test set `pro_direction_alignment +0.60` @ step 30K(val +0.74,跨歌手 -19% 可接受 gap)
+  - `voiced_spectral_ratio 0.96` ✅、`tdr_extra +0.03` ✅(M 對時間導數貢獻近零)
+  - **M4 vs VV ratio 11.26×**(val 11.67×,**L_id_pro 在 unseen 歌手仍工作**)
+  - test n=3773 統計穩定 25× 高於 val,結果可信
+  只是 wav 聽測管道下游斷了,人耳無法驗收 amateur 端。詳見
+  [phase2_outcome.md](docs/phase2_outcome.md)。
+- **對 Phase 3 部署的影響**:**阻塞**。Mode A / Mode B 推理最終都要 vocoder 出 wav 給
+  user,目前 vocoder 對 amateur 一定產生電音 → Phase 3 deploy 前必須處理。
+- **緩解方案(按優先順序)**:
+  1. **Vocoder fine-tune on Chinese singing** ⭐ 主路徑
+     - 用 M4Singer + dereverb'd VocalVerse 對 1012_hifigan 做 ~50K steps fine-tune
+     - 預估 1-2 天 A100,風險:可能略損 pro 端 SSIM (M4 0.94 → 0.90 可接受)
+     - Phase 3 prereq
+  2. **換 F0 extractor**(便宜驗證,非主路徑)
+     - 重新 binarize 用 parselmouth 替 torchcrepe → 看 amateur F0 是否變穩
+     - 估計只能把 VV F0 RMSE 53 → 30 Hz,仍 fail;優先級低
+  3. **Phase 0 補測 VV Gate ①**:把 VV 的 vocoder identity 結果固化進
+     [phase0_log.md](docs/phase0_log.md),避免下次重做又漏
+
 ## 持續監控項
 
 ### Monitor 1：資料策展 JSD 指標
@@ -98,12 +135,20 @@
 - **未達標後果**：D_z 會用 phoneme/register 分布差當捷徑
 - **偵測方式**：Phase 0 前處理 script 自動計算並報告
 
-### Monitor 1b：Vocoder identity test（Phase 0 必跑）
+### Monitor 1b：Vocoder identity test（Phase 0 必跑)
 - pretrained HifiGAN 餵中文歌聲 GT mel 重建
 - mel SSIM ≥ 0.90、F0 RMSE ≤ 10 Hz
 - **未達標後果**：vocoder 本身已是 bottleneck，後續 M 任何改進在聽測上都隱形
 - **偵測方式**：[`scripts/vocoder_identity_test.py`](scripts/vocoder_identity_test.py)
   在 Phase 0 自動跑，不過則 fine-tune vocoder 於中文歌聲後再進 Stage 1
+- ⚠ **Phase 0 實際覆蓋不足(2026-05 post-Phase-2 發現)**:Phase 0 只對 M4 跑 Gate ①
+  (PASS, SSIM=0.94 / F0 RMSE=5.8 Hz),**沒對 VocalVerse 單獨跑**。Phase 2 聽測發現
+  amateur 端有電音,用 [`scripts/diagnose_stage1_vocoder_path.py`](scripts/diagnose_stage1_vocoder_path.py)
+  補測 VV 在 vocoder(GT mel) 路徑就有 **SSIM=0.65 / F0 RMSE=53 Hz** — 大幅 FAIL,
+  證實 NSVB pretrained HifiGAN(英文 pop singing 訓練)對中文 amateur 分布不熟。
+  Stage 2 v2 在 mel 域訓練其實健康(見 [phase2_outcome.md](docs/phase2_outcome.md)),
+  但 amateur wav 聽測無法直接驗收;Phase 3 部署前必須 **vocoder fine-tune on
+  Chinese amateur(+ dereverb'd) mel**。詳見下方 [Risk 10](#risk-10vocoder-對-amateur-中文歌聲分布不熟新發現)。
 
 ### Monitor 2：Stage 1 CVAE 解耦品質
 - z_p 和 z_a 的分布在 Stage 1 訓練完後應該**高度重疊**（因為 F0/PPG/spk 都已條件化出去）
