@@ -104,40 +104,84 @@ pip install -r requirements.txt
 # 或手動裝(看 Requirements.txt 或 NSVB 原版的 environment.yml 對照)
 ```
 
-### 1.2 把 binarized data 從 Drive 同步到本機 SSD
+### 1.2 從 Drive 公開分享連結下載資料 + ckpts
 
-binarized 是 ~95GB(含 v2 m4singer + vocalverse + splits + centroids)。建議用 rclone:
-
-```powershell
-# 已備好 rclone.conf,從 Drive 拉
-rclone copy GD2CLL:NSVB-ZH/data/binarized C:\NSVB-ZH\data\binarized --progress
-# 預估 ~2-3h(視網速)
-```
-
-### 1.3 把 v2 ckpts 也拉下來(共用 stage1_best.pt)
+本機**沒有 rclone / GD2CLL 設定**,改走 `gdown` 吃 Google Drive 公開分享連結。
+user 會在交付時提供下列分享連結。
 
 ```powershell
-rclone copy GD2CLL:NSVB-ZH/checkpoints_v2 C:\NSVB-ZH\checkpoints_v2 --progress
+# 一次性裝 gdown
+pip install gdown
+
+# 下載 binarized v2(壓縮 tar.zst,~75 GB)
+# user 提供 share_id / share_url(例如 https://drive.google.com/file/d/<ID>/view?usp=share_link)
+$BINARIZED_TAR_ID = "<user_provides>"
+gdown "https://drive.google.com/uc?id=$BINARIZED_TAR_ID" -O data\binarized_v2.tar.zst
+
+# 解壓到 data\binarized_v2\(zstd 需先裝;Win 可裝 7-Zip 或 zstd Win build)
+# 推薦走 Python:
+pip install zstandard
+python -c "import zstandard, tarfile; `
+    dctx = zstandard.ZstdDecompressor(); `
+    with open('data/binarized_v2.tar.zst', 'rb') as ifh: `
+        with dctx.stream_reader(ifh) as zr: `
+            with tarfile.open(fileobj=zr, mode='r|') as tf: `
+                tf.extractall('data/')"
+# tar 內結構是 binarized/{m4singer,vocalverse,ppg_kmeans_centroids.npy}
+# 解開後路徑會是 data\binarized_v2\... — 我們改名統一為 data\binarized_v2
+Rename-Item data\binarized data\binarized_v2
+
+# 下載 v2 ckpts (stage1_best.pt + stage2_v2 全 ckpts,~3 GB)
+$CKPTS_ZIP_ID = "<user_provides>"
+gdown "https://drive.google.com/uc?id=$CKPTS_ZIP_ID" -O checkpoints_v2.zip
+Expand-Archive checkpoints_v2.zip -DestinationPath .
+
+# 下載 vocoder ckpt(NSVB pretrained,~150 MB)— 後續 eval / Plan C 用到
+$VOCODER_ID = "<user_provides>"
+gdown "https://drive.google.com/uc?id=$VOCODER_ID" -O `
+    checkpoints\1012_hifigan_all_songs_nsf\model_ckpt_steps_1170000.ckpt
 ```
 
-### 1.4 確認資料完整
+> ⚠ **三個 share ID 由 user 在交付時提供**,agent 不可自己亂猜或產生 URL。
+> 若 gdown 因為「too many requests」失敗,等 10-30 min 再試,或改用 user 給的備援連結。
+
+### 1.3 確認資料完整
 
 ```powershell
 # 確認 splits 跟兩 dataset 都在
-Get-ChildItem C:\NSVB-ZH\data\binarized
+Get-ChildItem C:\NSVB-ZH\data\binarized_v2
 # 應看到 m4singer/ vocalverse/ ppg_kmeans_centroids.npy splits/
 
 # 確認 Stage 1 ckpt
 Test-Path C:\NSVB-ZH\checkpoints_v2\stage1\stage1_best.pt
 # 應 True
+
+# 確認 vocoder ckpt
+Test-Path C:\NSVB-ZH\checkpoints\1012_hifigan_all_songs_nsf\model_ckpt_steps_1170000.ckpt
 ```
 
-### 1.5 GPU smoke test
+### 1.4 GPU smoke test
 
 ```powershell
 python -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 # 預期: CUDA: True, <GPU model>
 ```
+
+### 1.5 訓練/結果存放策略
+
+本機**不會 session 中斷**,所有 ckpts / logs / 中間 eval 結果**全留本地**,**不用背景 sync 回 Drive**。
+只在每 plan 結束後上傳「重要結果」(見 §7.5):
+
+| 資源 | 存放 |
+|---|---|
+| 訓中 ckpts `stage2_step{N}.pt`(每 5K 一個) | 本地 only,訓完不上傳 |
+| 訓中 audio_monitor `.npz` | 本地 only,debug 用 |
+| 訓中 raw log | 本地 only |
+| `stage2_best.pt`(早停 hook 自動產出) | **上傳** |
+| `stage2_final.pt`(=最後一步) | **上傳** |
+| `outputs/.../report.md`(eval 報告)| **上傳** |
+| `outputs/.../mel_grid.png` 子集(代表性 5-10 張)| **上傳** |
+| `runs/stage2_v3_plan{X}.summary.md`(log summary) | **上傳** |
 
 ---
 
@@ -161,10 +205,10 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.ge
 # 跑 100 步驗證 pipeline 通
 $env:PYTHONPATH = "."
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints\smoke_a `
-    --split-dir data\binarized\splits `
+    --split-dir data\binarized_v2\splits `
     --max-steps 100 `
     --batch-size 4 `
     --num-workers 0 `
@@ -184,10 +228,10 @@ python -m nsvb.task.stage2 `
 ```powershell
 $env:PYTHONPATH = "."
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints_v2\stage2_v3_planA `
-    --split-dir data\binarized\splits `
+    --split-dir data\binarized_v2\splits `
     --max-steps 50000 `
     --batch-size 16 `
     --num-workers 4 `
@@ -227,7 +271,7 @@ python -m nsvb.task.stage2 `
 ```powershell
 $env:PYTHONPATH = "."
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints\smoke_b `
     --max-steps 100 `
@@ -246,7 +290,7 @@ python -m nsvb.task.stage2 `
 
 ```powershell
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints_v2\stage2_v3_planB `
     --max-steps 50000 `
@@ -323,23 +367,23 @@ python scripts/audio_quality_probe.py `
 ```powershell
 # 1. 重 binarize 兩 dataset(M4 + VV 都重跑,~12h)
 python -m nsvb.data.binarizer `
-    --dataset m4singer --data-root data --out-root data\binarized_planC `
+    --dataset m4singer --data-root data --out-root data\binarized_v2_planC `
     --dereverb-backend df3_cascade `
     2>&1 | Tee-Object logs\binarize_m4_planC.log
 
 python -m nsvb.data.binarizer `
-    --dataset vocalverse --data-root data --out-root data\binarized_planC `
+    --dataset vocalverse --data-root data --out-root data\binarized_v2_planC `
     --dereverb-backend df3_cascade `
     --vocalverse-amateur-score-max 3.0 --vocalverse-chunk-sec 5.0 `
     2>&1 | Tee-Object logs\binarize_vv_planC.log
 
 # 2. 重 cluster PPG(K=100,per-utt-mean-norm) — ~30 min
 python -m nsvb.data.cluster_ppg fit-assign `
-    --binarized-root data\binarized_planC --k 100 --per-utt-mean-norm
+    --binarized-root data\binarized_v2_planC --k 100 --per-utt-mean-norm
 
 # 3. 重切 splits(seed=42 保持 deterministic)
 python scripts/make_splits.py `
-    --binarized-root data\binarized_planC `
+    --binarized-root data\binarized_v2_planC `
     --m4-test-singers Alto-2 Tenor-3 `
     --m4-val-songs-per-singer 2 `
     --vv-test-singer-frac 0.10 `
@@ -348,20 +392,20 @@ python scripts/make_splits.py `
 
 # 4. 重訓 Stage 1(~5h on A100)
 python -m nsvb.task.stage1 `
-    --binarized-root data\binarized_planC --ppg-dim 1280 `
+    --binarized-root data\binarized_v2_planC --ppg-dim 1280 `
     --batch-size 16 --max-steps 80000 `
     --init-from-nsvb checkpoints\nsvb_ckpts\nsvb_1030_vae_mle\model_ckpt_steps_200000.ckpt `
     --ckpt-dir checkpoints_v2\stage1_planC `
-    --split-dir data\binarized_planC\splits `
+    --split-dir data\binarized_v2_planC\splits `
     --val-interval 1000 --val-max-batches 50 `
     2>&1 | Tee-Object logs\stage1_planC.log
 
 # 5. 訓 Stage 2(套用 Plan A v3 配方,~5h on A100)
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized_planC `
+    --binarized-root data\binarized_v2_planC `
     --stage1-ckpt checkpoints_v2\stage1_planC\stage1_best.pt `
     --ckpt-dir checkpoints_v2\stage2_v3_planC `
-    --split-dir data\binarized_planC\splits `
+    --split-dir data\binarized_v2_planC\splits `
     --max-steps 50000 `
     --batch-size 16 --num-workers 4 `
     --lambda-patchnce 2.0 --lambda-identity-pro 0.2 --lambda-adv-mel 0.1 `
@@ -403,7 +447,7 @@ python -m scripts.vocoder_identity_test `
 ```powershell
 $env:PYTHONPATH = "."
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints\smoke_d `
     --max-steps 100 `
@@ -419,7 +463,7 @@ python -m nsvb.task.stage2 `
 
 ```powershell
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints_v2\stage2_v3_planD `
     --max-steps 50000 `
@@ -455,7 +499,7 @@ Plan E 試兩個變體:
 ```powershell
 # E-1
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints\smoke_e1 `
     --max-steps 100 --batch-size 4 --num-workers 0 --device cpu `
@@ -473,7 +517,7 @@ python -m nsvb.task.stage2 `
 ```powershell
 # E-1: 大 hidden_dim
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints_v2\stage2_v3_planE1 `
     --max-steps 50000 --batch-size 16 --num-workers 4 `
@@ -485,7 +529,7 @@ python -m nsvb.task.stage2 `
 
 # E-2: 大 hidden_dim + kernel=3
 python -m nsvb.task.stage2 `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --ckpt-dir checkpoints_v2\stage2_v3_planE2 `
     --max-steps 50000 --batch-size 16 --num-workers 4 `
@@ -511,8 +555,8 @@ $env:PYTHONPATH = "."
 python scripts/stage2_ckpts_listening.py `
     --stage1-ckpt checkpoints_v2\stage1\stage1_best.pt `
     --stage2-ckpt-dir checkpoints_v2\stage2_v3_$PLAN `
-    --binarized-root data\binarized `
-    --val-split data\binarized\splits\test.txt `
+    --binarized-root data\binarized_v2 `
+    --val-split data\binarized_v2\splits\test.txt `
     --out-dir outputs\stage2_v3_${PLAN}_listening_test `
     --all-samples --skip-vocoder --dump-mel --seed 42 `
     --steps "5000,10000,20000,30000,40000,50000"   # 含 best ckpt 的鄰近 steps
@@ -520,12 +564,12 @@ python scripts/stage2_ckpts_listening.py `
 # 2. mel-domain eval(~10 min)
 python scripts/stage2_mel_eval.py `
     --listening-dir outputs\stage2_v3_${PLAN}_listening_test `
-    --binarized-root data\binarized `
+    --binarized-root data\binarized_v2 `
     --pro-mean-n 500 --max-viz 20 `
     --out-dir outputs\stage2_v3_${PLAN}_eval_test
 ```
 
-(Plan C 路徑變 `data\binarized_planC`,其餘同。)
+(Plan C 路徑變 `data\binarized_v2_planC`,其餘同。)
 
 ### 7.2 score sheet 模板
 
@@ -561,6 +605,49 @@ python scripts/stage2_mel_eval.py `
 2. Stage 1 重訓改 fvae KL annealing
 3. Larger speaker pool(加更多 M4 歌手或新的 pro singing dataset)
 
+### 7.5 結果上傳(交付給 user)
+
+本機訓練不會被中斷,中間檔案全留本地。每 plan 結束後**只**整理「重要結果」到 `handoff\` 資料夾,user 再透過 Drive / remote desktop / 隨身碟拿。
+
+```powershell
+# 每 plan 結束後跑這段(替換 $PLAN)
+$PLAN = "planA"
+$HANDOFF = "handoff\$PLAN"
+New-Item -ItemType Directory -Force -Path $HANDOFF | Out-Null
+
+# 1. best + final ckpt(每個 ~150 MB,只兩個)
+Copy-Item checkpoints_v2\stage2_v3_$PLAN\stage2_best.pt $HANDOFF\
+Copy-Item checkpoints_v2\stage2_v3_$PLAN\stage2_latest.pt $HANDOFF\stage2_final.pt
+
+# 2. eval 報告 + per-step aggregate csv
+Copy-Item outputs\stage2_v3_${PLAN}_eval_test\report.md $HANDOFF\
+Copy-Item outputs\stage2_v3_${PLAN}_eval_test\metrics_aggregate.csv $HANDOFF\
+
+# 3. 代表性 mel_grid.png 子集(取前 5 張不要全部)
+$gridDir = "outputs\stage2_v3_${PLAN}_eval_test"
+Get-ChildItem $gridDir -Recurse -Filter "mel_grid.png" | Select-Object -First 5 | `
+    ForEach-Object {
+        $relPath = $_.FullName.Substring((Resolve-Path $gridDir).Path.Length + 1)
+        $destDir = Join-Path $HANDOFF (Split-Path $relPath -Parent)
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+        Copy-Item $_.FullName $destDir
+    }
+
+# 4. 訓 log 的 summary(不要傳整份 11 MB log)
+python scripts\summarize_stage2_log.py logs\stage2_v3_$PLAN.log
+Copy-Item logs\stage2_v3_$PLAN.summary.md $HANDOFF\
+
+# 5. tail 100 行原 log 給人看訓中收尾狀況
+Get-Content logs\stage2_v3_$PLAN.log -Tail 200 | Out-File $HANDOFF\train_log_tail.txt
+
+# 預期 $HANDOFF 大小:~500 MB(兩個 ckpt + 文字檔 + 5 張 PNG),容易傳
+```
+
+**最後總結:** 全部 plan 跑完後,寫 `handoff\training_results_v3.md`:
+- 把 §7.2 score sheet 填完
+- 推薦 lock 為 v3 的 plan + 理由
+- 把所有 `handoff\plan*` 打包成 `handoff_all.zip` 給 user
+
 ---
 
 ## 8. Handoff checklist
@@ -574,36 +661,42 @@ agent 啟動前確認以下都備好。
 
 ### 8.2 資料
 
-- [ ] `data/binarized/{m4singer,vocalverse}/*.npz` 都在
-- [ ] `data/binarized/splits/{train,val,test}.txt` 都在
-- [ ] `data/binarized/ppg_kmeans_centroids.npy` 在
+- [ ] `data/binarized_v2/{m4singer,vocalverse}/*.npz` 都在(從 §1.2 gdown + 解壓 + rename 完)
+- [ ] `data/binarized_v2/splits/{train,val,test}.txt` 都在
+- [ ] `data/binarized_v2/ppg_kmeans_centroids.npy` 在
 - [ ] `checkpoints_v2/stage1/stage1_best.pt` 在
+- [ ] `checkpoints/1012_hifigan_all_songs_nsf/model_ckpt_steps_1170000.ckpt` 在(eval 用)
 
 ### 8.3 環境
 
 - [ ] CUDA 可用 (`torch.cuda.is_available() == True`)
 - [ ] `pip install deepfilternet` 可正常 import
-- [ ] `pip install matplotlib scipy soundfile` 都裝好(eval 用)
+- [ ] `pip install matplotlib scipy soundfile gdown zstandard` 都裝好(eval + 下載用)
 
-### 8.4 預期執行時間總和
+### 8.4 預期執行時間總和(本機 GPU,無 session 中斷)
 
 | 場景 | 時間 |
 |---|---|
+| 一次性前置(下載 + 解壓) | ~3-5h(看網速) |
 | Plan A only | ~5h 訓 + 3h eval = 8h |
-| Plan A + E1 + E2(平行,共用 GPU 排隊)| 3 × 8h = 24h |
-| 全 plan (A/B/D/E1/E2 平行 + 視結果決定 C) | 30-40h 直到結論 |
+| Plan A + E1 + E2(連續排隊,單 GPU) | ~24h |
+| 全 plan (A/B/D/E1/E2 連續) + 視結果決定 C | 40-60h 直到結論 |
+
+不需要 session 中斷處理,本機 GPU 可一路跑。
 
 ### 8.5 失敗模式 & 回報
 
 agent 訓中如果遇到:
 - **OOM**:降 `--batch-size` 16 → 12 或 8 → 4
-- **NaN loss**:把對應 plan log 末段抓出來,看出問題的 step + loss 各分量
-- **早停 hook 卡住**:val_eval 一次 ~15s,若超過 5 min 還沒回應 → 寫到主 log,降 `--val-eval-n-samples` 到 10
+- **NaN loss**:把對應 plan log 末段抓出來,看出問題的 step + loss 各分量;塞到 handoff 內 `nan_report.txt`
+- **早停 hook 卡住**:val_eval 一次 ~15s,若超過 5 min 還沒回應 → 降 `--val-eval-n-samples` 到 10
 - **訓完 eval 沒產 mel_grid.png**:很可能是 listening dir 內 .mel.npy 沒 dump,確認跑 listening 時有加 `--dump-mel`
 
-每 plan 跑完後 agent 應產出:
-1. `logs/stage2_v3_plan{X}.log` 完整訓練 log
-2. `outputs/stage2_v3_plan{X}_eval_test/report.md` eval 報告
-3. **跟 §7.2 score sheet 比 v2 的單行結論**(在 plan 主 log 末尾印一段 summary)
+每 plan 跑完後 agent 應產出(全部在 `handoff\plan{X}\`,見 §7.5):
+1. `stage2_best.pt` + `stage2_final.pt`
+2. `report.md`(eval)+ `metrics_aggregate.csv` + 5 張 mel_grid.png
+3. `stage2_v3_plan{X}.summary.md`(訓 log summary)
+4. `train_log_tail.txt`(原 log 末 200 行)
+5. **plan 主 log 末段 print 一段 v2-vs-this-plan 單行結論**(供 user 快讀)
 
-最後一份結案:`docs/training_results_v3.md` 把 score sheet 填完,加上「推薦 lock 為 v3 的 plan」 + 理由。
+最後一份結案在 `handoff\training_results_v3.md`,填完 §7.2 score sheet + 推薦 lock 為 v3 的 plan + 理由,然後把所有 `handoff\plan*` 打包成 `handoff_all.zip` 給 user。
