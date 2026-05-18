@@ -91,59 +91,68 @@
 
 ```powershell
 # Windows PowerShell
-# git
-git clone https://github.com/<your-org>/NSVB-ZH C:\NSVB-ZH
+# 1. clone repo 到 HEAD
+git clone https://github.com/o0Yura0o/NewSVB-ZH C:\NSVB-ZH
 cd C:\NSVB-ZH
-git checkout (Get-Content COMMIT_HASH.txt)
 
-# Python 3.10+, PyTorch with CUDA
-# 假設機器有 conda
+# 2. 裝 Python 環境(假設機器有 conda)
 conda create -n nsvbzh python=3.10 -y
 conda activate nsvbzh
 pip install -r requirements.txt
-# 或手動裝(看 Requirements.txt 或 NSVB 原版的 environment.yml 對照)
+pip install gdown zstandard      # 下載 + 解壓用,requirements.txt 沒包
+
+# 3. 下載 COMMIT_HASH.txt(user 在交付時提供 share URL)→ checkout 該 commit
+$COMMIT_HASH_URL = "https://drive.google.com/file/d/1617BW72HAGlxoFNVH3nB7QQVCUeWoG86/view?usp=sharing"      # 例 https://drive.google.com/file/d/XXX/view?usp=sharing
+gdown --fuzzy $COMMIT_HASH_URL -O COMMIT_HASH.txt
+git checkout (Get-Content COMMIT_HASH.txt).Trim()
+
+# 4. sanity check 程式碼有 v3 flags
+python -m nsvb.task.stage2 --help | Select-String "f0-support|lambda-pro-match|m-hidden-dim|val-eval-interval"
+# 預期 4 行 match
 ```
 
 ### 1.2 從 Drive 公開分享連結下載資料 + ckpts
 
 本機**沒有 rclone / GD2CLL 設定**,改走 `gdown` 吃 Google Drive 公開分享連結。
-user 會在交付時提供下列分享連結。
+user 在交付時提供下列 3 個 share URL(放進對應變數即可)。
 
 ```powershell
-# 一次性裝 gdown
-pip install gdown
+# 3 個 share URL 由 user 提供(連同 §1.1 的 COMMIT_HASH 共 4 個):
+$BINARIZED_TAR_URL  = "https://drive.google.com/file/d/18IJHqgT9czv5macM19_EGqXVhhHL2Q7j/view?usp=sharing"
+$CKPTS_FOLDER_URL   = "https://drive.google.com/drive/folders/1JGM01Rp6ZYkzgme9WvKyWW2jJamiPylv?usp=sharing"
+$VOCODER_FOLDER_URL = "https://drive.google.com/drive/folders/1kINxjnW5O-fQPrRnAl5mETjI5Ovvkedw?usp=sharing"
 
-# 下載 binarized v2(壓縮 tar.zst,~75 GB)
-# user 提供 share_id / share_url(例如 https://drive.google.com/file/d/<ID>/view?usp=share_link)
-$BINARIZED_TAR_ID = "<user_provides>"
-gdown "https://drive.google.com/uc?id=$BINARIZED_TAR_ID" -O data\binarized_v2.tar.zst
+# ── A. binarized v2 (單一 tar.zst 檔案,~75 GB) ─────────────────────
+gdown --fuzzy $BINARIZED_TAR_URL -O data\binarized_v2.tar.zst
 
-# 解壓到 data\binarized_v2\(zstd 需先裝;Win 可裝 7-Zip 或 zstd Win build)
-# 推薦走 Python:
-pip install zstandard
+# 解壓 (Python zstandard module,跨平台不用裝 zstd binary)
 python -c "import zstandard, tarfile; `
     dctx = zstandard.ZstdDecompressor(); `
     with open('data/binarized_v2.tar.zst', 'rb') as ifh: `
         with dctx.stream_reader(ifh) as zr: `
             with tarfile.open(fileobj=zr, mode='r|') as tf: `
                 tf.extractall('data/')"
+
 # tar 內結構是 binarized/{m4singer,vocalverse,ppg_kmeans_centroids.npy}
-# 解開後路徑會是 data\binarized_v2\... — 我們改名統一為 data\binarized_v2
+# 解開後在 data\binarized\,我們改名統一成 data\binarized_v2
 Rename-Item data\binarized data\binarized_v2
 
-# 下載 v2 ckpts (stage1_best.pt + stage2_v2 全 ckpts,~3 GB)
-$CKPTS_ZIP_ID = "<user_provides>"
-gdown "https://drive.google.com/uc?id=$CKPTS_ZIP_ID" -O checkpoints_v2.zip
-Expand-Archive checkpoints_v2.zip -DestinationPath .
+# 驗證解壓成功(預期看到 m4singer/ vocalverse/ ppg_kmeans_centroids.npy splits/)
+Get-ChildItem data\binarized_v2
 
-# 下載 vocoder ckpt(NSVB pretrained,~150 MB)— 後續 eval / Plan C 用到
-$VOCODER_ID = "<user_provides>"
-gdown "https://drive.google.com/uc?id=$VOCODER_ID" -O `
-    checkpoints\1012_hifigan_all_songs_nsf\model_ckpt_steps_1170000.ckpt
+# ── B. v2 ckpts (整個資料夾,~3 GB) ─────────────────────────────
+# 是 Drive 「資料夾」share,要 --folder + -O 指定本地落地目錄。
+# Drive 內結構假設為 stage1/ + stage2_v2/ 兩個子資料夾
+gdown --folder $CKPTS_FOLDER_URL -O checkpoints_v2
+
+# ── C. vocoder ckpt 資料夾 (~150 MB) ──────────────────────────
+# 同樣是「資料夾」share。Drive 內應含 model_ckpt_steps_1170000.ckpt
+gdown --folder $VOCODER_FOLDER_URL -O checkpoints\1012_hifigan_all_songs_nsf
 ```
 
-> ⚠ **三個 share ID 由 user 在交付時提供**,agent 不可自己亂猜或產生 URL。
+> ⚠ **三個 share URL 由 user 在交付時提供**(連同 §1.1 的 COMMIT_HASH 共 4 個),agent 不可自己亂猜或產生。
 > 若 gdown 因為「too many requests」失敗,等 10-30 min 再試,或改用 user 給的備援連結。
+> 若 Drive 內檔案組織跟預期不同(例如 stage1_best.pt 不在 checkpoints_v2/stage1/),agent 需要手動 mv 到符合預期路徑;否則後續 `--stage1-ckpt` 等指令會找不到檔。
 
 ### 1.3 確認資料完整
 
