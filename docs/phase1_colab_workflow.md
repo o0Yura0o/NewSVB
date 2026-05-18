@@ -408,10 +408,12 @@ v2 對策:
 # Stage 1 → Stage 2 v2 unattended overnight 訓練
 # 前置:§1.1–§1.5 已跑完(mount + env + 解壓 binarized + splits)
 # Drive 目的地:checkpoints_v2/ (新前綴,避開 phase0 §3.5 symlink 鏈)
-# 輸出:訓練每一行 log 都即時印在 cell 下面(像 !cmd 那樣),同步 tee 到 Drive log file
+# 輸出:訓練每一行 log 都即時印在 cell 下面(同 §3 `!cmd | tee` 路徑),
+#       並同步 tee 到 Drive log file
 # ============================================================
-import os, sys, time, subprocess, threading
+import os, time, subprocess, threading, shlex
 from pathlib import Path
+from IPython import get_ipython
 
 REPO         = '/content/NSVB-ZH'
 LOCAL_S1     = '/content/stage1_ckpts'
@@ -438,44 +440,24 @@ for p in (DRIVE_S1, DRIVE_S2, DRIVE_LOGS):
     verify_drive_real(p)
 print('✅ Drive 路徑 verify 通過')
 
-# ── 重要:streaming subprocess runner ─────────────────────────
-# 為什麼不用 `subprocess.call(... | tee logfile)`:雖然 stdout 會 inherit 到
-# notebook,但 shell pipeline 內的 tqdm/python print 走完整個 pipe buffer 才
-# flush,實測會卡好幾分鐘才出現一批,看起來像「training cell 沒輸出」(附錄 A 條目)。
-# 改用 Popen + 逐行 read + 主執行緒 print + 寫 log file → 即時 streaming + 落 Drive log。
-def stream_run(cmd_argv: list[str], log_path: str, env_extra: dict | None = None,
-               cwd: str | None = None) -> int:
-    """跑指令並把 stdout/stderr line-by-line 同時 print 到 notebook + 寫到 log_path。
+# ── 跑訓練 + 同步 tee log ────────────────────────────────────
+# 為什麼用 get_ipython().system 而非 subprocess.call:
+#   notebook 環境下 subprocess.call("cmd", shell=True) 雖然 stdout 由 kernel
+#   繼承,但 kernel 只用 Python 層 OutStream 攔截 sys.stdout — 子程序對 fd 1
+#   的 raw write 不會到 cell 顯示。!cmd 與 get_ipython().system 內部會把
+#   subprocess stdout 接 pipe 逐行讀回再 print,才能在 cell 即時 streaming。
+# 為什麼還是用 `2>&1 | tee logfile`:同 §3 模式,讓 shell 把 stdout 同時送到
+#   pipe(被 IPython 讀回 notebook)與 log file(被 §1 background sync 推 Drive)。
+def run_streamed(cmd_argv: list[str], log_path: str) -> int:
+    """跑訓練 cmd,在 cell 即時印 log 同時 tee 到 log_path。回傳 exit code。
 
-    Args:
-        cmd_argv: 不走 shell,直接 argv list(避免 quoting 地雷)。
-        log_path: log file 落地路徑(會即時 flush 一行就寫一行)。
-        env_extra: 額外環境變數(例如 PYTHONPATH)。
-        cwd: 子程序工作目錄。
-    Returns: exit code。
+    底層走 IPython `!cmd | tee logfile`(透過 get_ipython().system),跟 §3 一致。
     """
-    env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
-    proc = subprocess.Popen(
-        cmd_argv,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        bufsize=1,                 # line-buffered(配合 python -u / line_buffering)
-        text=True, encoding='utf-8', errors='replace',
-        env=env, cwd=cwd,
-    )
-    try:
-        # log file 也 line-buffered(每行立即 flush 給 Drive sync 看到)
-        with open(log_path, 'a', buffering=1, encoding='utf-8') as logf:
-            logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} | {' '.join(cmd_argv)} ====\n")
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                logf.write(line)
-    finally:
-        rc = proc.wait()
-    return rc
+    cmd = ' '.join(shlex.quote(a) for a in cmd_argv)
+    full = f'{cmd} 2>&1 | tee -a {shlex.quote(log_path)}'
+    ip = get_ipython()
+    ip.system(full)
+    return int(ip.user_ns.get('_exit_code', '0'))
 
 # 1. 背景 sync(stage1 → DRIVE_S1, stage2 → DRIVE_S2)
 _sync_stop = threading.Event()
@@ -520,9 +502,9 @@ stage1_latest = Path(LOCAL_S1) / 'stage1_latest.pt'
 if stage1_best.exists():
     print(f'⏭️  Stage 1 已完成: {stage1_best} 存在,skip Stage 1 直接跑 Stage 2')
 else:
-    # python -u:強制 unbuffered → tqdm + print 都即時吐到 Popen pipe(配合 stream_run 才能逐行印)
     cmd1 = [
-        'python', '-u', '-m', 'nsvb.task.stage1',
+        'env', 'PYTHONPATH=.',
+        'python', '-m', 'nsvb.task.stage1',
         '--binarized-root', 'data/binarized',
         '--ppg-dim', '1280',
         '--batch-size', '16',
@@ -540,7 +522,7 @@ else:
         print('▶️  Stage 1 start (cold start)')
     log1 = f"{DRIVE_LOGS}/stage1_{ts}.log"
     print(f'   log → {log1}')
-    rc = stream_run(cmd1, log_path=log1, env_extra={'PYTHONPATH': '.'}, cwd=REPO)
+    rc = run_streamed(cmd1, log_path=log1)
     if rc != 0:
         print(f'❌ Stage 1 exit code {rc} → 停 sync,不繼續 Stage 2')
         _sync_stop.set(); sync_thread.join(timeout=180)
@@ -553,7 +535,8 @@ else:
 # 4. Stage 2 v2:freeze_d_mel + λ_adv_mel=0.05 + lr_dz=2e-4
 stage2_latest = Path(LOCAL_S2) / 'stage2_latest.pt'
 cmd2 = [
-    'python', '-u', '-m', 'nsvb.task.stage2',
+    'env', 'PYTHONPATH=.',
+    'python', '-m', 'nsvb.task.stage2',
     '--binarized-root', 'data/binarized',
     '--ppg-dim', '1280',
     '--batch-size', '16',
@@ -573,7 +556,7 @@ else:
     print('▶️  Stage 2 v2 start (from scratch)')
 log2 = f"{DRIVE_LOGS}/stage2_v2_{ts}.log"
 print(f'   log → {log2}')
-rc2 = stream_run(cmd2, log_path=log2, env_extra={'PYTHONPATH': '.'}, cwd=REPO)
+rc2 = run_streamed(cmd2, log_path=log2)
 print(f'Stage 2 exit code: {rc2}')
 
 # 5. 收尾:停 sync + 最終 rsync
@@ -590,10 +573,10 @@ print('✅ All ckpts 已完整落 Drive (checkpoints_v2/stage1 + checkpoints_v2/
 ```
 
 > **為什麼這樣設計?**
-> 1. **`stream_run()` 用 `Popen` 逐行讀 + 同步寫 stdout/log_file**,避免 `subprocess.call("... | tee ...")` 在 shell pipeline 裡 tqdm 卡 buffer 不出來的問題(實測過,進度條會卡幾分鐘才現一次)。
-> 2. **`python -u`** 強制子程序 unbuffered stdout,配合 stage1/stage2.py 內已有的 `sys.stdout.reconfigure(line_buffering=True)`,每行 print 立即吐到 pipe。
-> 3. **argv list 不走 shell**:避免 quoting 地雷(路徑含空白、`&` 等)。
-> 4. **`log_path` 以 append mode 開**:resume 時不洗掉舊 log。同一 session 跑多次重連也累積得到完整訓練史。
+> 1. **`run_streamed()` 走 `get_ipython().system(... | tee logfile)`**:跟 §3 的 `!cmd | tee logfile` 同一條路徑(IPython 內部用 Popen 接 pipe 逐行讀回 cell),不需要自己寫讀 loop。Notebook 下 `subprocess.call(shell=True)` 子程序對 fd 1 的 write 不會到 cell 顯示,必須走 IPython 這條路。
+> 2. **`env PYTHONPATH=. python -m ...`** 前綴 `env`:用 argv list 又要設環境變數最乾淨的做法(等效於 shell 的 `PYTHONPATH=. python ...`)。
+> 3. **`tee -a` append mode**:resume 時不洗掉舊 log;同一 session 多次重連也累積得到完整訓練史。
+> 4. **argv list + `shlex.quote`** 再組成 shell command:避免路徑含空白 / 特殊字元的 quoting 地雷。
 
 ### 醒來檢查清單
 
