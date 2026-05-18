@@ -59,11 +59,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nsvb.utils.audio_config import NUM_MELS
 
 # 健康閾值(對齊 training_flow.md §3.6.1 / stage2.py monitor)
+#
+# 注意:`temporal_diff_ratio_mel` 跟 `hf_energy_increase` 的 baseline 已含 Stage 1
+# VAE 重建本身的差異(典型 tdr_mel_baseline ~1.0, hf_baseline ~-0.01)。
+# 直接套絕對閾值會把 VAE 噪音底歸咎給 M。
+# 改看 `tdr_mel_extra` / `hf_energy_increase_extra`(扣掉 baseline 後)才能正確判 M。
 HEALTHY = {
     "unvoiced_concentration": {"good": 0.55, "warn": 0.65},
     "voiced_spectral_ratio":  {"good": 0.70, "warn": 0.40},  # ≥0.7 健康, <0.4 警訊
-    "temporal_diff_ratio_mel": {"good": 0.30, "warn": 1.0},
-    "hf_energy_increase":     {"good": 0.20, "warn": 0.50},  # +20% 內健康
+    # _extra 才是 M 的真實貢獻(baseline 已 ~1.0,M 多加 < 0.3 才算健康)
+    "temporal_diff_ratio_mel_extra": {"good": 0.30, "warn": 1.0},
+    # 高頻能量變化:±0.20 健康內,-0.35~-0.20 marginal(高頻略削),
+    # > +0.50 hiss/金屬感警訊,< -0.35 抹掉齒音/氣聲/亮度警訊
+    "hf_energy_increase_extra": {"good_abs": 0.20, "warn_low": -0.35, "warn_high": 0.50},
     "pro_direction_alignment":{"good": 0.30, "warn": 0.0},   # >0.3 健康(正方向), <0 反方向
 }
 
@@ -72,7 +80,8 @@ HEALTHY = {
 
 def compute_metrics(mel_out: np.ndarray, mel_orig: np.ndarray,
                     mel_baseline: np.ndarray, f0: np.ndarray,
-                    pro_mean_env: np.ndarray) -> dict:
+                    pro_mean_env: np.ndarray,
+                    baseline_metrics: dict = None) -> dict:
     """計算單一 (sample, step) 的所有 mel-domain 指標。
 
     Args:
@@ -81,6 +90,10 @@ def compute_metrics(mel_out: np.ndarray, mel_orig: np.ndarray,
         mel_baseline:  [T, NUM_MELS] - stage1 only (M=None) 重建的 mel
         f0:            [T] - f0 (Hz);voiced = (f0 > 0)
         pro_mean_env:  [NUM_MELS] - 全 pro 集的 mean envelope (axis=0 reduction)
+        baseline_metrics: 可選,baseline (_1_stage1_recon) 的 metrics dict。給了會額外
+                          算 `_extra` 版指標 = current - baseline,扣掉 VAE 重建底噪後
+                          M 的真實貢獻。對 `temporal_diff_ratio_mel` / `hf_energy_increase`
+                          / `mel_l1_vs_orig` 有意義(它們參考 mel_orig,含 VAE noise)。
 
     Returns: dict of metric_name -> float
     """
@@ -149,11 +162,12 @@ def compute_metrics(mel_out: np.ndarray, mel_orig: np.ndarray,
     tdr_mel = float(np.mean(np.abs(dt_out - dt_orig)) /
                     (np.mean(np.abs(dt_orig)) + 1e-10))
 
-    return {
-        # 內容保留
+    result = {
+        # 修飾幅度(M 改了多少;**不**等於 content preservation 證明,真的 content 保留
+        # 要靠 PPG similarity / ASR / phoneme posterior 等,目前 backlog)
         "mel_l1_vs_orig":           mel_l1_vs_orig,
         "mel_l1_vs_recon":          mel_l1_vs_recon,
-        # 修飾方向
+        # 修飾方向(僅看 time-averaged envelope,不證明 pitch / vibrato / 咬字 更好)
         "pro_dist_orig":            pro_dist_orig,
         "pro_dist_baseline":        pro_dist_baseline,
         "pro_dist_out":             pro_dist_out,
@@ -162,10 +176,25 @@ def compute_metrics(mel_out: np.ndarray, mel_orig: np.ndarray,
         # 健康
         "unvoiced_concentration":   unvoiced_concentration,
         "voiced_spectral_ratio":    voiced_spectral_ratio,
-        # Artifact
+        # Artifact(原始版,baseline 含 VAE 重建底噪,看 _extra 比較精準)
         "hf_energy_increase":       hf_energy_increase,
         "temporal_diff_ratio_mel":  tdr_mel,
     }
+
+    # ── _extra 版指標(扣 baseline 噪音底,M 的真實貢獻)──
+    # 三個用 mel_orig 當參考的指標都受 VAE 重建噪音影響;_extra = current - baseline
+    # 給定 baseline_metrics(self-vs-self)時:_extra 應該全 0
+    # 給定 step_N(M+decoder)時:_extra 反映 M 在 baseline 之上又加/減了多少
+    if baseline_metrics is not None:
+        for k in ("temporal_diff_ratio_mel", "hf_energy_increase", "mel_l1_vs_orig"):
+            base_v = baseline_metrics.get(k, 0.0)
+            result[f"{k}_extra"] = result[k] - base_v
+    else:
+        # baseline 自己跟自己比,_extra 定義為 0(語意一致性)
+        for k in ("temporal_diff_ratio_mel", "hf_energy_increase", "mel_l1_vs_orig"):
+            result[f"{k}_extra"] = 0.0
+
+    return result
 
 
 def compute_pro_mean_env(binarized_root: Path, pro_dataset: str, n: int,
@@ -242,12 +271,12 @@ def render_mel_grid(mels: dict, f0: np.ndarray, metrics: dict,
         if label in metrics and metrics[label]:
             m = metrics[label]
             tag = (
-                f"L1_orig={m.get('mel_l1_vs_orig', 0):.3f}  "
                 f"L1_recon={m.get('mel_l1_vs_recon', 0):.3f}  "
                 f"uv_conc={m.get('unvoiced_concentration', 0):.2f}  "
                 f"vsr={m.get('voiced_spectral_ratio', 0):.2f}  "
                 f"pro_dir={m.get('pro_direction_alignment', 0):+.2f}  "
-                f"pro_dist={m.get('pro_dist_out', 0):.2f}"
+                f"tdr_extra={m.get('temporal_diff_ratio_mel_extra', 0):+.2f}  "
+                f"hf_extra={m.get('hf_energy_increase_extra', 0):+.2f}"
             )
             ax.set_title(tag, fontsize=7, loc="left", pad=2)
 
@@ -343,11 +372,12 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
     base_labels = ["_1_stage1_recon"] + step_labels  # orig 沒 metric
 
     metric_keys = [
-        "mel_l1_vs_orig", "mel_l1_vs_recon",
+        "mel_l1_vs_orig", "mel_l1_vs_orig_extra", "mel_l1_vs_recon",
         "pro_dist_baseline", "pro_dist_out", "pro_dist_delta",
         "pro_direction_alignment",
         "unvoiced_concentration", "voiced_spectral_ratio",
-        "hf_energy_increase", "temporal_diff_ratio_mel",
+        "hf_energy_increase", "hf_energy_increase_extra",
+        "temporal_diff_ratio_mel", "temporal_diff_ratio_mel_extra",
     ]
 
     # ── aggregate CSV ──
@@ -382,21 +412,37 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
         spec = HEALTHY.get(label_pref)
         if not spec:
             return ""
-        good, warn = spec["good"], spec["warn"]
+        # ── voiced_spectral_ratio: 越大越好 ──
         if label_pref == "voiced_spectral_ratio":
+            good, warn = spec["good"], spec["warn"]
             if metric_value >= good:
                 return "✅"
             return "❌" if metric_value < warn else "⚠️"
+        # ── pro_direction_alignment: 正號好 ──
         if label_pref == "pro_direction_alignment":
+            good, warn = spec["good"], spec["warn"]
             if metric_value > good:
                 return "✅"
             return "❌" if metric_value < warn else "⚠️"
-        # 其他(越小越好)
+        # ── hf_energy_increase_extra: 兩側都不好(中間健康)──
+        if label_pref == "hf_energy_increase_extra":
+            good_abs = spec["good_abs"]      # ±0.20 內 healthy
+            warn_low = spec["warn_low"]      # < -0.35 嚴重削掉高頻
+            warn_high = spec["warn_high"]    # > +0.50 hiss/金屬感
+            if abs(metric_value) <= good_abs:
+                return "✅"
+            if metric_value < warn_low or metric_value > warn_high:
+                return "❌"
+            return "⚠️"
+        # ── 其他(unvoiced_concentration, tdr_mel_extra):越小越好 ──
+        good, warn = spec["good"], spec["warn"]
         if metric_value <= good:
             return "✅"
         return "❌" if metric_value > warn else "⚠️"
 
-    headers = ["step", "L1_recon", "uv_conc", "vsr", "pro_dir", "pro_dist_Δ", "tdr_mel", "hf_E"]
+    # 顯示 _extra 版本(已扣 Stage 1 VAE 重建底噪,反映 M 的真實貢獻)
+    headers = ["step", "L1_recon", "uv_conc", "vsr", "pro_dir", "pro_dist_Δ",
+               "tdr_extra", "hf_extra"]
     rows = []
     for label in base_labels:
         all_keys = m4_keys + vv_keys
@@ -410,8 +456,8 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
             f"{m['voiced_spectral_ratio']:.2f} {verdict('voiced_spectral_ratio', m['voiced_spectral_ratio'])}",
             f"{m['pro_direction_alignment']:+.2f} {verdict('pro_direction_alignment', m['pro_direction_alignment'])}",
             f"{m['pro_dist_delta']:+.3f}",
-            f"{m['temporal_diff_ratio_mel']:.2f} {verdict('temporal_diff_ratio_mel', m['temporal_diff_ratio_mel'])}",
-            f"{m['hf_energy_increase']:+.2f} {verdict('hf_energy_increase', m['hf_energy_increase'])}",
+            f"{m['temporal_diff_ratio_mel_extra']:+.2f} {verdict('temporal_diff_ratio_mel_extra', m['temporal_diff_ratio_mel_extra'])}",
+            f"{m['hf_energy_increase_extra']:+.2f} {verdict('hf_energy_increase_extra', m['hf_energy_increase_extra'])}",
         ]
         rows.append(row)
     widths = [max(len(str(c)) for c in [h] + [r[i] for r in rows])
@@ -538,13 +584,22 @@ def main():
             continue
 
         sample_metrics: dict = {}
+        # 先算 baseline (_1_stage1_recon) 的 metrics,後續 step 都拿這個算 _extra
+        baseline_metrics = compute_metrics(
+            mel_baseline, mel_orig, mel_baseline, f0, pro_mean_env,
+            baseline_metrics=None,  # baseline 自己 _extra 全 0
+        )
         for label, mel_out in mels.items():
             if label == "_0_orig":
                 # orig 沒比較對象(它就是 orig 本身)
                 sample_metrics[label] = {}
                 continue
+            if label == "_1_stage1_recon":
+                sample_metrics[label] = baseline_metrics
+                continue
             sample_metrics[label] = compute_metrics(
                 mel_out, mel_orig, mel_baseline, f0, pro_mean_env,
+                baseline_metrics=baseline_metrics,
             )
 
         (sample_out / "metrics.json").write_text(

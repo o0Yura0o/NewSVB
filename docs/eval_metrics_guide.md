@@ -49,19 +49,30 @@
 
 按「想看 M 的什麼性質」分類。每組指標只解釋設計動機跟健康判讀，公式詳細請看 [scripts/stage2_mel_eval.py](../scripts/stage2_mel_eval.py) `compute_metrics()` 與 [nsvb/task/stage2.py](../nsvb/task/stage2.py) `train_step` / `monitor_audio_quality`。
 
-### 2.A 內容保留 — M 改了多少
+### 2.A 修飾幅度 — M 實際改了多少
+
+> ⚠ **名稱注意**：這組指標**反映「M 改了多少」**,但**不能直接證明 content 被保留**。
+> 真正的 content preservation 需要額外指標(PPG similarity / ASR-based CER /
+> phoneme posterior distance / duration alignment 一致性),目前 backlog,尚未實作。
+> 如果未來想驗收「M 沒亂改歌詞」,要新增這組指標,不要把 `mel_l1_vs_recon` 當代理。
 
 | 指標 | 直觀含意 | 健康範圍 | 在哪看 |
 |---|---|---|---|
-| `mel_l1_vs_orig` | M+decoder 輸出 vs 原 amateur mel，全部差異總和 | 同 baseline 同數量級（~0.3–0.6） | eval `report.md` |
-| `mel_l1_vs_recon` | 上面那項扣掉 VAE 重建底噪，**只剩 M 的純貢獻** | 訓練開始 ~0，訓中增大但 < 1.0 | eval `report.md` |
-| `delta_over_z`（**latent 版本**） | ‖M(z) − z‖ / ‖z‖；M 在 latent 空間動了 z 多少 | 0.03 ~ 0.30 「健康」（文件 §3.6.1） | 訓中 log + summary |
+| `mel_l1_vs_orig` | M+decoder 輸出 vs 原 amateur mel,全部差異總和 | 含 VAE 重建底噪,單看意義有限 | eval `report.md` |
+| `mel_l1_vs_orig_extra` | 上面那項扣掉 baseline,**只剩 M 在 baseline 之上的修飾量** | 0 ~ 0.3 健康(M 在 baseline 之上多動了一些) | eval `report.md` |
+| `mel_l1_vs_recon` | M+decoder 輸出 vs Stage 1 only baseline,**M 的純貢獻** | 訓練開始 ~0,訓中增大但 < 1.0 | eval `report.md` |
+| `delta_over_z`(**latent 版本**) | ‖M(z) − z‖ / ‖z‖;M 在 latent 空間動了 z 多少 | 0.03 ~ 0.30 「健康」(文件 §3.6.1) | 訓中 log + summary |
 
 **為什麼有兩個版本（mel 跟 latent）**：
 - latent 版（`delta_over_z`）便宜：訓中順手算。**但它的數值跟「實際聽起來改變多少」對應很糟** — 0.87 看起來「過度修飾」，但在 mel 域可能是 envelope shift 0.5（健康範圍）。
 - mel 版（`mel_l1_vs_recon`）是 ground truth：mel 是真正餵給 vocoder 的東西。
 
 **v2 經驗教訓**：latent 版 0.87 讓我們以為訓壞了，mel 版顯示其實是健康狀態。**判訓練好壞優先看 mel 版**。
+
+**`_extra` 是什麼**:很多 mel 指標需要跟 GT mel 比(`mel_l1_vs_orig`、`temporal_diff_ratio_mel`、
+`hf_energy_increase`),但 Stage 1 VAE 重建本身就會跟 GT 差(tdr_mel ~1.0、hf 略偏)。
+直接看絕對值會把 VAE 噪音底歸咎給 M。**`_extra` 版 = current step − baseline(`_1_stage1_recon`)**,
+扣掉 VAE 重建底噪後 M 的真實貢獻。建議優先看 `_extra` 版。
 
 ### 2.B 修飾方向 — M 改的「方向」對嗎
 
@@ -79,6 +90,19 @@ SVB（singing voice beautification）是「unpaired」任務 — 同一句業餘
 **怎麼讀數字**（v2 step 30000 為例）：
 - `pro_dist_delta = +0.23`：修飾後比原 amateur 接近 pro 平均 0.23 個距離單位 → 確實往 pro 走
 - `pro_direction_alignment = +0.74`：修飾向量跟「往 pro 的方向」cosine = 0.74 → 七成走對方向，剩下三成是 noise 或副作用
+
+> ⚠ **重要 caveat — pro_direction_alignment 能/不能證明什麼**:
+> 這個指標**只看 time-averaged envelope**(沿時間軸平均後的 80 維向量)到 pro 平均的方向。
+> 它能說的:「輸出的頻譜包絡**平均形狀**有沒有往 pro 靠」。
+> 它**不能證明**:
+> - phrase 表現更專業(沒看時間動態)
+> - vibrato 更自然(被時間平均掉了)
+> - pitch 更準(F0 不在 envelope 內)
+> - 咬字更好(phoneme 細節被平均)
+> - 聽感一定更好(envelope 對但顫音被改寫,聽起來可能變糟)
+>
+> 適合當 **model selection proxy**(在多個 step 中挑相對最 pro 的),**不能取代主觀聽測**。
+> 數字高也要看 §2.C 健康指標跟 §2.D artifact 都通過,才算「真的更 pro」。
 
 ### 2.C 健康指標 — M 的修飾「集中在哪」
 
@@ -99,21 +123,34 @@ SVB（singing voice beautification）是「unpaired」任務 — 同一句業餘
 
 `voiced_spectral_ratio` 抓「voiced 段裡的修飾是慢還是快」。慢時間變化 = envelope 平移（音色微調，自然）。快時間變化 = 高頻 jitter（顫音/滑音被改寫，破壞時間細節）。健康值 ≥ 0.7 表示主要在做 envelope shift。
 
-**v2 經驗**：兩者都 ✅ healthy（0.59 borderline / 0.96 ✅），代表 M 走對方向。
+**v2 經驗**：
+- `voiced_spectral_ratio 0.96` ✅ — voiced 段修飾是 envelope shift,健康
+- `unvoiced_concentration 0.59` ⚠️ — **不是完全 healthy 而是 marginal**(< 0.65 警訊線但已偏向 unvoiced)。
+  Risk 2 沒爆,但 M 的修飾有點偏到 unvoiced 段。**未來若要再優化,降低 unvoiced delta 是優先目標**
+  (例如加 voiced/unvoiced 修飾比例 loss)。
+- 不要把 v2 的 uv_conc 0.59 當「完全沒問題」 — 它是「可接受但有改善空間」。
 
 ### 2.D Artifact 檢查 — M 是不是在加噪
 
 | 指標 | 直觀含意 | 健康範圍 | 在哪看 |
 |---|---|---|---|
-| `hf_energy_increase` | 高頻（mel bin ≥ 50）能量相對 orig 的變化比例 | **−0.20 ~ +0.20 健康**, > 0.50 警訊 | eval `report.md` |
-| `temporal_diff_ratio_mel` | mel 域時間導數差異 / 原 mel 自身時間導數 | **< 0.3 健康**, > 1.0 嚴重 | 同上 |
-| `temporal_diff_ratio`（**latent 版**） | 同上但在 latent 算 | 同上 | 訓中 log |
+| `hf_energy_increase` | 高頻(mel bin ≥ 50)能量相對 orig 的變化比例 | 含 VAE 噪音底,看 `_extra` 比較準 | eval `report.md` |
+| **`hf_energy_increase_extra`** | 上面那項扣 baseline,**M 的純貢獻** | **±0.20 healthy / −0.35 ~ −0.20 marginal / < −0.35 ❌(削掉氣聲)/ > +0.50 ❌(hiss)** | eval `report.md` |
+| `temporal_diff_ratio_mel` | mel 域時間導數差異 / 原 mel 自身時間導數 | 含 VAE 噪音底(baseline 就 ~1.0!),看 `_extra` 比較準 | eval `report.md` |
+| **`temporal_diff_ratio_mel_extra`** | 上面那項扣 baseline,**M 在 baseline 之上多加的時間導數噪音** | **< 0.3 健康, > 1.0 嚴重** | eval `report.md` |
+| `temporal_diff_ratio`(**latent 版**)| 同上但在 latent 算 | 0.3 健康, 1.0 嚴重 | 訓中 log |
 
-`hf_energy_increase` 漂得太正 → M 加了高頻 hiss / 金屬感。漂得太負 → M 把高頻細節抹掉。
+**`hf_energy_increase_extra`**:漂得太正 → M 加了高頻 hiss / 金屬感。漂得太負 → M 把高頻細節抹掉(齒音 s/sh/ts、氣聲、亮度)。
+**注意非對稱**:正向 +0.50 才警訊,負向 -0.35 就警訊 — 因為高頻 detail 一旦抹掉很難 vocoder 端補回來。
 
-`temporal_diff_ratio` 大 → M 改寫了時間結構（顫音/滑音變化曲線）。在 latent 版本對應前面說的「過度激進」現象。
+**`temporal_diff_ratio_mel_extra`**:大 → M 在 baseline 之上又改寫了時間結構(顫音 / 滑音的細節)。
+若 `_extra` 接近 0(像 v2 step120K 0.04)代表 M 動的時間導數跟 VAE 本身差不多,**沒額外破壞時間結構**。
 
-**v2 經驗**：mel 版 1.22 ❌、latent 版 0.81 ❌。兩者都偏高。但同時 `voiced_spectral_ratio` 0.96 ✅ 表示主要的時間變化是在 unvoiced 段。配合 `unvoiced_concentration` 0.59 ⚠️，整體判斷：M 有輕度「動 unvoiced 段」傾向，但還沒到要重訓的程度。
+**v2 經驗教訓**:`temporal_diff_ratio_mel` 原始值 1.22 看似 ❌,但 baseline 就 1.18 — `_extra` 只 0.04,**M 在時間導數上其實沒做大事**。
+原本看絕對值會誤判「M 過度破壞時間結構」,扣掉 baseline 後才看到 M 是清白的。
+
+**為什麼 baseline tdr_mel 就 ~1.0**:VAE 重建有固有的 frame-to-frame 微小 jitter,而 mel 自身的時間導數很慢(voiced 段平滑),分母小 → ratio 容易飆到 1+。
+這不代表 Stage 1 訓壞,是 metric 對 small denominator 敏感 + VAE 的 KL bottleneck 必然帶來的精度損失。詳見 [phase2_outcome.md §3](phase2_outcome.md) 的 latent vs mel 衝突討論。
 
 ### 2.E 訓中 GAN 動態指標
 
@@ -288,6 +325,19 @@ v2 經驗：mel 域指標顯示 **step 30000** 是 alignment 最高（+0.74）�
 - 健康閾值（uv_conc 0.55、vsr 0.70 等）是基於 v1 + v2 兩次訓練 + synthetic test 校準的經驗值。
 - 不是論文驗證過的 absolute truth，未來訓不同 dataset 可能要重新校準。
 - 質性比定量重要：「相對方向對嗎」比「數字落不落在 0.55」重要。
+
+### 5.7 mel_l1_vs_recon ≠ content preservation
+
+`mel_l1_vs_recon` 只代表「M 在 mel domain 改了多少」,**不能直接證明歌詞/咬字/旋律被保留**。
+真正驗證 content 保留需要的指標(目前 backlog,未實作):
+
+- **PPG similarity**: 對 GT mel 跟 output mel 各抽 PPG(Whisper hidden state),算 cosine sim;低 → 咬字 / 音素變了
+- **ASR / lyrics CER**: 對 wav 跑 Whisper ASR,跟原始歌詞算 CER;高 → 歌詞被改寫
+- **Phoneme posterior distance**: 對 PPG 序列做 phoneme-level alignment 差異
+- **Duration / alignment consistency**: 用 DTW 對齊 GT / output,看 phoneme 邊界偏移
+
+未來若要正式驗收「M 沒亂改歌詞」,該補這組指標,**不要把 `mel_l1_vs_recon` 低就當 content 保留**。
+(目前 v2 的 `mel_l1_vs_recon ~0.5` 直觀上「M 修飾不大」,但邏輯上不能保證歌詞沒變。我們靠耳朵聽測補這個盲點。)
 
 ---
 
