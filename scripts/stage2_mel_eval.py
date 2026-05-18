@@ -537,6 +537,10 @@ def main():
                     help="pro 端用哪個 dataset 算 mean envelope 參考(預設 m4singer)")
     ap.add_argument("--pro-mean-n", type=int, default=100,
                     help="採樣多少 pro samples 算 pro mean envelope(預設 100)")
+    ap.add_argument("--max-viz", type=int, default=20,
+                    help="最多 render 幾個 sample 的 mel_grid.png(預設 20;全 test set"
+                         " 跑時不會 render 4000 張)。設 0 全部不畫;設 -1 不限制。"
+                         "metrics.json 跟 aggregate 仍對所有 sample 計算。")
     ap.add_argument("--out-dir", type=Path, required=True)
     args = ap.parse_args()
 
@@ -572,6 +576,22 @@ def main():
         raise SystemExit("沒收到任何 sample,退出")
 
     # ── 3. compute metrics per (sample, label) + 畫圖 + 寫 json ──
+    # 為了在大規模 eval(全 test set ~4K)時避免 render 數千張 PNG,挑 mix-of-M4-and-VV
+    # 的前 max_viz 個畫圖,其餘只算 metrics(metrics.json 仍寫,給 spot debug 用)
+    all_keys = sorted(samples.keys())
+    if args.max_viz == 0:
+        viz_keys = set()
+    elif args.max_viz < 0:
+        viz_keys = set(all_keys)
+    else:
+        m4_first = [k for k in all_keys if k.startswith("m4singer_")]
+        vv_first = [k for k in all_keys if k.startswith("vocalverse_")]
+        # 平均分配 viz quota:M4 半 / VV 半
+        n_m4 = min(len(m4_first), args.max_viz // 2)
+        n_vv = min(len(vv_first), args.max_viz - n_m4)
+        viz_keys = set(m4_first[:n_m4] + vv_first[:n_vv])
+    print(f"[viz] will render mel_grid.png for {len(viz_keys)}/{len(samples)} samples")
+
     per_sample: dict = {}
     for s_key, (mels, f0, _item_id, _ds) in samples.items():
         sample_out = args.out_dir / s_key
@@ -608,13 +628,14 @@ def main():
         )
         per_sample[s_key] = sample_metrics
 
-        # 視覺化
-        render_mel_grid(
-            mels=mels, f0=f0, metrics=sample_metrics,
-            out_path=sample_out / "mel_grid.png",
-            sample_title=s_key,
-        )
-        print(f"[plot] {s_key}/mel_grid.png")
+        # 視覺化(只對 viz_keys 內的 sample 畫)
+        if s_key in viz_keys:
+            render_mel_grid(
+                mels=mels, f0=f0, metrics=sample_metrics,
+                out_path=sample_out / "mel_grid.png",
+                sample_title=s_key,
+            )
+            print(f"[plot] {s_key}/mel_grid.png")
 
     # ── 4. aggregate report ──
     aggregate_and_report(per_sample, args.out_dir)

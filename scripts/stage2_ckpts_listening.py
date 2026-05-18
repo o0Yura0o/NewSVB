@@ -143,16 +143,20 @@ def find_npz(item_id: str, binarized_root: Path):
 
 
 @torch.no_grad()
-def run_mode_a(svbvae: SVBVAEZh, M, vocoder: HifiGanNSFGenerator,
-               npz_path: Path, device: str):
+def run_mode_a(svbvae: SVBVAEZh, M, vocoder, npz_path: Path, device: str,
+               skip_vocoder: bool = False):
     """單筆 Mode A 推理:.npz → mel/ppg/f0/spk → φ → (M) → θ → vocoder → wav。
     M=None 時走 Stage 1 only baseline(沒有 M 的純重建)。
 
     為什麼用 m_q 而非採樣 z:跟 stage2 _encode_and_downsample 一致,deterministic
     inference 較穩;採樣會引入 noise,不利對比聽測。
 
+    Args:
+        skip_vocoder: True 時跳過 vocoder forward(vocoder 可傳 None)。給 stage2_mel_eval
+                      在全 test set 上跑(vocoder 是 bottleneck;不要 wav 時可省 ~85% 時間)。
+
     Returns:
-        wav   : np.ndarray [T_audio]
+        wav   : np.ndarray [T_audio]  或 None (skip_vocoder=True)
         mel_out: np.ndarray [T_orig, NUM_MELS]  decoder 輸出的 mel(送 vocoder 前)
                  給 stage2_mel_eval 共用,不重跑 inference
     """
@@ -189,6 +193,9 @@ def run_mode_a(svbvae: SVBVAEZh, M, vocoder: HifiGanNSFGenerator,
     # mel 在 eval 用(time-major,跟 .npz['mel'] 同 layout)
     mel_out_np = mel_out_chfirst.squeeze(0).transpose(0, 1).cpu().numpy()  # [T_orig, NUM_MELS]
 
+    if skip_vocoder:
+        return None, mel_out_np
+
     # vocoder 端:F0 unvoiced log-space 內插
     f0_interp = interp_f0_unvoiced(f0_np[:T_orig])
     f0_v = torch.from_numpy(f0_interp).unsqueeze(0).to(device)
@@ -204,8 +211,8 @@ def main():
                         help='Path to stage1_best.pt(SVBVAEZh backbone)')
     parser.add_argument('--stage2-ckpt-dir', required=True,
                         help='Folder containing stage2_step*.pt files')
-    parser.add_argument('--vocoder-ckpt', required=True,
-                        help='Path to NSVB 1012 HifiGAN ckpt')
+    parser.add_argument('--vocoder-ckpt', default=None,
+                        help='Path to NSVB 1012 HifiGAN ckpt(--skip-vocoder 啟用時可省略)')
     parser.add_argument('--binarized-root', required=True,
                         help='Folder with m4singer/ and vocalverse/ subdirs of .npz')
     parser.add_argument('--val-split', required=True,
@@ -222,32 +229,51 @@ def main():
     parser.add_argument('--dump-mel', action='store_true',
                         help='同時 dump 每組 mel 為 .npy (orig/stage1_recon/step{N}.mel.npy), '
                              '供 scripts/stage2_mel_eval.py 直接讀,不用重跑 inference')
+    parser.add_argument('--skip-vocoder', action='store_true',
+                        help='跳過 vocoder forward(節省 85% 時間,但只能生 mel 不生 wav)。'
+                             '配 --dump-mel 用於全 test set 跑 eval。--vocoder-ckpt 可省略。')
+    parser.add_argument('--all-samples', action='store_true',
+                        help='忽略 --n-samples,跑 val_split 內全部樣本。'
+                             '搭配 --skip-vocoder --dump-mel 用於全 test set eval。')
     args = parser.parse_args()
+
+    if not args.skip_vocoder and not args.vocoder_ckpt:
+        parser.error('--vocoder-ckpt 必填(除非 --skip-vocoder)')
 
     device = args.device
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     binarized_root = Path(args.binarized_root)
 
-    # 抽樣:bias 偏 VocalVerse(amateur 是聽測重點)
+    # 抽樣:bias 偏 VocalVerse(amateur 是聽測重點);--all-samples 時改取全部
     val_list = [s.strip() for s in Path(args.val_split).read_text().splitlines() if s.strip()]
     val_vv = [v for v in val_list if '__c' in v]
     val_m4 = [v for v in val_list if '#' in v and v not in val_vv]
 
     random.seed(args.seed)
-    n_vv = max(args.n_samples - 1, 1)
-    picks = random.sample(val_vv, min(n_vv, len(val_vv)))
-    if val_m4 and len(picks) < args.n_samples:
-        picks += random.sample(val_m4, args.n_samples - len(picks))
-    print(f'[picks] {len(picks)} samples (seed={args.seed}):')
-    for p in picks:
-        print(f'  - {p}')
+    if args.all_samples:
+        picks = val_vv + val_m4
+        random.shuffle(picks)  # deterministic shuffle 給 eval 跑順序
+        print(f'[picks] ALL {len(picks)} samples (M4={len(val_m4)}, VV={len(val_vv)}, '
+              f'seed={args.seed} for shuffle)')
+    else:
+        n_vv = max(args.n_samples - 1, 1)
+        picks = random.sample(val_vv, min(n_vv, len(val_vv)))
+        if val_m4 and len(picks) < args.n_samples:
+            picks += random.sample(val_m4, args.n_samples - len(picks))
+        print(f'[picks] {len(picks)} samples (seed={args.seed}):')
+        for p in picks:
+            print(f'  - {p}')
 
-    # 載入共用模型(只載一次)
+    # 載入共用模型(只載一次);--skip-vocoder 時跳過 vocoder 載入
     print(f'\n[load] SVBVAEZh backbone from {args.stage1_ckpt}')
     svbvae = load_svbvae(args.stage1_ckpt, device)
-    print(f'[load] vocoder from {args.vocoder_ckpt}')
-    vocoder = load_vocoder(args.vocoder_ckpt, device)
+    if args.skip_vocoder:
+        vocoder = None
+        print(f'[load] vocoder SKIPPED (--skip-vocoder)')
+    else:
+        print(f'[load] vocoder from {args.vocoder_ckpt}')
+        vocoder = load_vocoder(args.vocoder_ckpt, device)
 
     step_list = [int(s.strip()) for s in args.steps.split(',') if s.strip()]
     print(f'\n[steps] {len(step_list)} stage2 ckpts to evaluate: {step_list}')
@@ -264,20 +290,26 @@ def main():
         print(f'\n[sample] {ds}/{item_id}  →  {sample_dir.name}/')
 
         # _0_orig wav + mel(mel 取自 .npz['mel'],即 binarize 的 GT)
+        # skip_vocoder 時不讀 wav 欄位(.npz 內 wav 是 ~5MB 大頭,跳過省 IO + Drive FUSE)
         with np.load(npz_path, allow_pickle=True) as d:
-            wav_orig = d['wav'].astype(np.float32)
             mel_orig = d['mel'].astype(np.float32)            # [T, NUM_MELS]
             f0_orig = d['f0'].astype(np.float32)
-        sf.write(str(sample_dir / '_0_orig.wav'), wav_orig, SAMPLE_RATE)
-        print(f'  _0_orig.wav  (T_audio={len(wav_orig)} ≈ {len(wav_orig)/SAMPLE_RATE:.2f}s)')
+            wav_orig = None if args.skip_vocoder else d['wav'].astype(np.float32)
+        if not args.skip_vocoder:
+            sf.write(str(sample_dir / '_0_orig.wav'), wav_orig, SAMPLE_RATE)
+            print(f'  _0_orig.wav  (T_audio={len(wav_orig)} ≈ {len(wav_orig)/SAMPLE_RATE:.2f}s)')
+        else:
+            print(f'  (skip-vocoder, T_mel={mel_orig.shape[0]} ≈ {mel_orig.shape[0]/172:.2f}s)')
         if args.dump_mel:
             np.save(str(sample_dir / '_0_orig.mel.npy'), mel_orig)
             np.save(str(sample_dir / 'f0.npy'), f0_orig)
 
         # _1_stage1_recon(M=None)
-        wav_s1, mel_s1 = run_mode_a(svbvae, None, vocoder, npz_path, device)
-        sf.write(str(sample_dir / '_1_stage1_recon.wav'), wav_s1, SAMPLE_RATE)
-        print(f'  _1_stage1_recon.wav')
+        wav_s1, mel_s1 = run_mode_a(svbvae, None, vocoder, npz_path, device,
+                                     skip_vocoder=args.skip_vocoder)
+        if not args.skip_vocoder:
+            sf.write(str(sample_dir / '_1_stage1_recon.wav'), wav_s1, SAMPLE_RATE)
+            print(f'  _1_stage1_recon.wav')
         if args.dump_mel:
             np.save(str(sample_dir / '_1_stage1_recon.mel.npy'), mel_s1)
 
@@ -288,9 +320,11 @@ def main():
                 print(f'  ✗ step{step}: ckpt not at {ckpt_path}')
                 continue
             M = load_M(str(ckpt_path), device)
-            wav_s2, mel_s2 = run_mode_a(svbvae, M, vocoder, npz_path, device)
-            sf.write(str(sample_dir / f'step{step:06d}.wav'), wav_s2, SAMPLE_RATE)
-            print(f'  step{step:06d}.wav')
+            wav_s2, mel_s2 = run_mode_a(svbvae, M, vocoder, npz_path, device,
+                                         skip_vocoder=args.skip_vocoder)
+            if not args.skip_vocoder:
+                sf.write(str(sample_dir / f'step{step:06d}.wav'), wav_s2, SAMPLE_RATE)
+                print(f'  step{step:06d}.wav')
             if args.dump_mel:
                 np.save(str(sample_dir / f'step{step:06d}.mel.npy'), mel_s2)
             del M  # 釋放 GPU 記憶體
