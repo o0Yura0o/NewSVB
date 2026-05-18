@@ -144,12 +144,17 @@ def find_npz(item_id: str, binarized_root: Path):
 
 @torch.no_grad()
 def run_mode_a(svbvae: SVBVAEZh, M, vocoder: HifiGanNSFGenerator,
-               npz_path: Path, device: str) -> np.ndarray:
+               npz_path: Path, device: str):
     """單筆 Mode A 推理:.npz → mel/ppg/f0/spk → φ → (M) → θ → vocoder → wav。
     M=None 時走 Stage 1 only baseline(沒有 M 的純重建)。
 
     為什麼用 m_q 而非採樣 z:跟 stage2 _encode_and_downsample 一致,deterministic
     inference 較穩;採樣會引入 noise,不利對比聽測。
+
+    Returns:
+        wav   : np.ndarray [T_audio]
+        mel_out: np.ndarray [T_orig, NUM_MELS]  decoder 輸出的 mel(送 vocoder 前)
+                 給 stage2_mel_eval 共用,不重跑 inference
     """
     d = np.load(npz_path, allow_pickle=True)
     mel_np = d['mel'].astype(np.float32)
@@ -181,12 +186,14 @@ def run_mode_a(svbvae: SVBVAEZh, M, vocoder: HifiGanNSFGenerator,
     mel_out_chfirst = svbvae.fvae.decoder(z_in, mask_exp, g)   # [1, NUM_MELS, T_pad]
     # 砍回 T_orig
     mel_out_chfirst = mel_out_chfirst[:, :, :T_orig]
+    # mel 在 eval 用(time-major,跟 .npz['mel'] 同 layout)
+    mel_out_np = mel_out_chfirst.squeeze(0).transpose(0, 1).cpu().numpy()  # [T_orig, NUM_MELS]
 
     # vocoder 端:F0 unvoiced log-space 內插
     f0_interp = interp_f0_unvoiced(f0_np[:T_orig])
     f0_v = torch.from_numpy(f0_interp).unsqueeze(0).to(device)
     wav = vocoder(mel_out_chfirst, f0_v).squeeze(1).squeeze(0).cpu().numpy()
-    return wav
+    return wav, mel_out_np
 
 
 def main():
@@ -212,6 +219,9 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                         help='樣本選擇 random seed(同 seed → 跨 ckpt 樣本完全一致)')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--dump-mel', action='store_true',
+                        help='同時 dump 每組 mel 為 .npy (orig/stage1_recon/step{N}.mel.npy), '
+                             '供 scripts/stage2_mel_eval.py 直接讀,不用重跑 inference')
     args = parser.parse_args()
 
     device = args.device
@@ -253,16 +263,23 @@ def main():
         sample_dir.mkdir(parents=True, exist_ok=True)
         print(f'\n[sample] {ds}/{item_id}  →  {sample_dir.name}/')
 
-        # _0_orig
+        # _0_orig wav + mel(mel 取自 .npz['mel'],即 binarize 的 GT)
         with np.load(npz_path, allow_pickle=True) as d:
             wav_orig = d['wav'].astype(np.float32)
+            mel_orig = d['mel'].astype(np.float32)            # [T, NUM_MELS]
+            f0_orig = d['f0'].astype(np.float32)
         sf.write(str(sample_dir / '_0_orig.wav'), wav_orig, SAMPLE_RATE)
         print(f'  _0_orig.wav  (T_audio={len(wav_orig)} ≈ {len(wav_orig)/SAMPLE_RATE:.2f}s)')
+        if args.dump_mel:
+            np.save(str(sample_dir / '_0_orig.mel.npy'), mel_orig)
+            np.save(str(sample_dir / 'f0.npy'), f0_orig)
 
         # _1_stage1_recon(M=None)
-        wav_s1 = run_mode_a(svbvae, None, vocoder, npz_path, device)
+        wav_s1, mel_s1 = run_mode_a(svbvae, None, vocoder, npz_path, device)
         sf.write(str(sample_dir / '_1_stage1_recon.wav'), wav_s1, SAMPLE_RATE)
         print(f'  _1_stage1_recon.wav')
+        if args.dump_mel:
+            np.save(str(sample_dir / '_1_stage1_recon.mel.npy'), mel_s1)
 
         # Stage 2 each step
         for step in step_list:
@@ -271,9 +288,11 @@ def main():
                 print(f'  ✗ step{step}: ckpt not at {ckpt_path}')
                 continue
             M = load_M(str(ckpt_path), device)
-            wav_s2 = run_mode_a(svbvae, M, vocoder, npz_path, device)
+            wav_s2, mel_s2 = run_mode_a(svbvae, M, vocoder, npz_path, device)
             sf.write(str(sample_dir / f'step{step:06d}.wav'), wav_s2, SAMPLE_RATE)
             print(f'  step{step:06d}.wav')
+            if args.dump_mel:
+                np.save(str(sample_dir / f'step{step:06d}.mel.npy'), mel_s2)
             del M  # 釋放 GPU 記憶體
 
     print(f'\n✅ done. 下載 {out_dir}/ 來聽。')
