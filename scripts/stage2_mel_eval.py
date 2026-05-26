@@ -49,14 +49,21 @@ import random
 import sys
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nsvb.utils.audio_config import NUM_MELS
+
+# matplotlib 只在 render_mel_grid / render_zspace_tsne 等繪圖函式內 lazy import,
+# 讓 aggregate_and_report 等純文字處理函式可被 rerender 工具復用(無需裝 matplotlib)
+
+
+def _lazy_import_plt():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
 
 # 健康閾值(對齊 training_flow.md §3.6.1 / stage2.py monitor)
 #
@@ -260,6 +267,7 @@ def render_mel_grid(mels: dict, f0: np.ndarray, metrics: dict,
         out_path: PNG 輸出
         sample_title: 整圖 super-title(e.g. "vocalverse / user01_song")
     """
+    plt = _lazy_import_plt()
     n_rows = len(mels)
     fig, axes = plt.subplots(
         n_rows, 1, figsize=(14, 1.6 * n_rows),
@@ -396,16 +404,20 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
         "temporal_diff_ratio_mel", "temporal_diff_ratio_mel_extra",
     ]
 
-    # ── aggregate CSV ──
-    csv_lines = ["sample,label," + ",".join(metric_keys)]
-    for s_key in sorted(per_sample.keys()):
-        for label in base_labels:
-            m = per_sample[s_key].get(label)
-            if m is None:
-                continue
-            vals = ",".join(f"{m.get(k, 0):.4f}" for k in metric_keys)
-            csv_lines.append(f"{s_key},{label},{vals}")
-    (out_dir / "metrics_aggregate.csv").write_text("\n".join(csv_lines), encoding="utf-8")
+    # ── aggregate CSV(用 csv.writer 自動處理含逗號的 sample 名)──
+    # 為什麼用 csv.writer:M4 部份歌名含逗號(例如「想你,零点零一分」),手動 join
+    # 不做 quoting 會讓 row 多出一欄,後續 reload(rerender 工具)會 parse 出錯
+    import csv as _csv
+    with (out_dir / "metrics_aggregate.csv").open("w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["sample", "label"] + metric_keys)
+        for s_key in sorted(per_sample.keys()):
+            for label in base_labels:
+                m = per_sample[s_key].get(label)
+                if m is None:
+                    continue
+                row = [s_key, label] + [f"{m.get(k, 0):.4f}" for k in metric_keys]
+                w.writerow(row)
 
     # ── M4 vs VV 分組 ──
     m4_keys = [k for k in per_sample if k.startswith("m4singer_")]
@@ -417,30 +429,21 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
             return {}
         return {mk: float(np.mean([it[mk] for it in items])) for mk in metric_keys}
 
-    # ── report.md ──
-    lines = ["# Stage 2 mel-domain evaluation\n"]
-    lines.append(f"- samples: {len(per_sample)}  (m4={len(m4_keys)}, vv={len(vv_keys)})")
-    lines.append(f"- steps:   {len(step_labels)}\n")
-
-    lines.append("## Per-step aggregate (mean over samples)\n")
-
+    # ── verdict helper ──
     def verdict(label_pref: str, metric_value: float) -> str:
         spec = HEALTHY.get(label_pref)
         if not spec:
             return ""
-        # ── voiced_spectral_ratio: 越大越好 ──
         if label_pref == "voiced_spectral_ratio":
             good, warn = spec["good"], spec["warn"]
             if metric_value >= good:
                 return "✅"
             return "❌" if metric_value < warn else "⚠️"
-        # ── pro_direction_alignment: 正號好 ──
         if label_pref == "pro_direction_alignment":
             good, warn = spec["good"], spec["warn"]
             if metric_value > good:
                 return "✅"
             return "❌" if metric_value < warn else "⚠️"
-        # ── hf_energy_increase_extra: 兩側都不好(中間健康)──
         if label_pref == "hf_energy_increase_extra":
             good_abs = spec["good_abs"]      # ±0.20 內 healthy
             warn_low = spec["warn_low"]      # < -0.35 嚴重削掉高頻
@@ -450,62 +453,163 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
             if metric_value < warn_low or metric_value > warn_high:
                 return "❌"
             return "⚠️"
-        # ── 其他(unvoiced_concentration, tdr_mel_extra):越小越好 ──
+        # 其他(unvoiced_concentration, tdr_mel_extra):越小越好
         good, warn = spec["good"], spec["warn"]
         if metric_value <= good:
             return "✅"
         return "❌" if metric_value > warn else "⚠️"
 
-    # 顯示 _extra 版本(已扣 Stage 1 VAE 重建底噪,反映 M 的真實貢獻)
-    headers = ["step", "L1_recon", "uv_conc", "vsr", "pro_dir", "pro_dist_Δ",
-               "tdr_extra", "hf_extra"]
-    rows = []
-    for label in base_labels:
-        all_keys = m4_keys + vv_keys
-        m = mean_over_samples(all_keys, label)
-        if not m:
-            continue
-        row = [
-            label,
-            f"{m['mel_l1_vs_recon']:.3f}",
-            f"{m['unvoiced_concentration']:.2f} {verdict('unvoiced_concentration', m['unvoiced_concentration'])}",
-            f"{m['voiced_spectral_ratio']:.2f} {verdict('voiced_spectral_ratio', m['voiced_spectral_ratio'])}",
-            f"{m['pro_direction_alignment']:+.2f} {verdict('pro_direction_alignment', m['pro_direction_alignment'])}",
-            f"{m['pro_dist_delta']:+.3f}",
-            f"{m['temporal_diff_ratio_mel_extra']:+.2f} {verdict('temporal_diff_ratio_mel_extra', m['temporal_diff_ratio_mel_extra'])}",
-            f"{m['hf_energy_increase_extra']:+.2f} {verdict('hf_energy_increase_extra', m['hf_energy_increase_extra'])}",
-        ]
-        rows.append(row)
-    widths = [max(len(str(c)) for c in [h] + [r[i] for r in rows])
-              for i, h in enumerate(headers)]
-    lines.append("| " + " | ".join(h.ljust(w) for h, w in zip(headers, widths)) + " |")
-    lines.append("|" + "|".join("-" * (w + 2) for w in widths) + "|")
-    for r in rows:
-        lines.append("| " + " | ".join(c.ljust(w) for c, w in zip(r, widths)) + " |")
+    def render_table(headers, rows):
+        widths = [max(len(str(c)) for c in [h] + [r[i] for r in rows])
+                  for i, h in enumerate(headers)]
+        out = []
+        out.append("| " + " | ".join(h.ljust(w) for h, w in zip(headers, widths)) + " |")
+        out.append("|" + "|".join("-" * (w + 2) for w in widths) + "|")
+        for r in rows:
+            out.append("| " + " | ".join(c.ljust(w) for c, w in zip(r, widths)) + " |")
+        return out
+
+    # ── report.md ──
+    lines = ["# Stage 2 mel-domain evaluation\n"]
+    lines.append(f"- samples: {len(per_sample)}  (m4={len(m4_keys)}, vv={len(vv_keys)})")
+    lines.append(f"- steps:   {len(step_labels)}")
+    lines.append("")
+    lines.append("> **報告結構**:VV(amateur)是主要推理對象,M4(pro)只是 control "
+                 "看 M 沒過度修飾;故主表用 VV-only 平均算指標跟 verdict。")
+    lines.append("> baseline `_1_stage1_recon` 列出供 reference,**它的指標是 self-vs-self**"
+                 "(0 或 undefined),不打 ✅/❌。")
     lines.append("")
 
-    # ── M4 vs VV 對比(control sanity)──
+    # ── §1. VV-only per-step aggregate(主表)──
+    lines.append("## 1. VV(amateur)per-step aggregate — 主要推理品質\n")
+    if not vv_keys:
+        lines.append("(無 VV samples,跳過 VV 表)\n")
+    else:
+        headers = ["step", "L1_recon", "uv_conc", "vsr", "pro_dir", "pro_dist_Δ",
+                   "tdr_extra", "hf_extra"]
+        rows = []
+        for label in base_labels:
+            m = mean_over_samples(vv_keys, label)
+            if not m:
+                continue
+            if label == "_1_stage1_recon":
+                # baseline 列:self-vs-self,verdict 沒意義 → 不打符號
+                row = [
+                    label + " (ref)",
+                    f"{m['mel_l1_vs_recon']:.3f}",
+                    f"{m['unvoiced_concentration']:.2f}",
+                    f"{m['voiced_spectral_ratio']:.2f}",
+                    f"{m['pro_direction_alignment']:+.2f}",
+                    f"{m['pro_dist_delta']:+.3f}",
+                    f"{m['temporal_diff_ratio_mel_extra']:+.2f}",
+                    f"{m['hf_energy_increase_extra']:+.2f}",
+                ]
+            else:
+                row = [
+                    label,
+                    f"{m['mel_l1_vs_recon']:.3f}",
+                    f"{m['unvoiced_concentration']:.2f} {verdict('unvoiced_concentration', m['unvoiced_concentration'])}",
+                    f"{m['voiced_spectral_ratio']:.2f} {verdict('voiced_spectral_ratio', m['voiced_spectral_ratio'])}",
+                    f"{m['pro_direction_alignment']:+.2f} {verdict('pro_direction_alignment', m['pro_direction_alignment'])}",
+                    f"{m['pro_dist_delta']:+.3f}",
+                    f"{m['temporal_diff_ratio_mel_extra']:+.2f} {verdict('temporal_diff_ratio_mel_extra', m['temporal_diff_ratio_mel_extra'])}",
+                    f"{m['hf_energy_increase_extra']:+.2f} {verdict('hf_energy_increase_extra', m['hf_energy_increase_extra'])}",
+                ]
+            rows.append(row)
+        lines.extend(render_table(headers, rows))
+        lines.append("")
+
+    # ── §2. M4 control:只看 L1_recon 是否保持小 + pro_dir 接近 0 ──
+    lines.append("## 2. M4(pro control)per-step — 只驗 M 沒過度修飾 pro\n")
+    if not m4_keys:
+        lines.append("(無 M4 samples,跳過 M4 control 表)\n")
+    else:
+        lines.append("此表的健康判定**標準不同**:M 對 pro 應該接近 identity。")
+        lines.append("- `L1_recon` 應極小(< 0.10);若 ≥ 0.20 表示 L_id_pro 失效")
+        lines.append("- `pro_dir` 接近 0(M 沒拉 pro,因為 pro 已經是 pro);"
+                     "若 > +0.30 表示 M 對 pro 也在「再 pro 化」,可能是 mode collapse")
+        lines.append("")
+        m4_headers = ["step", "L1_recon", "pro_dir", "tdr_extra", "hf_extra", "備註"]
+        m4_rows = []
+        for label in base_labels:
+            m = mean_over_samples(m4_keys, label)
+            if not m:
+                continue
+            l1 = m["mel_l1_vs_recon"]
+            pro_dir = m["pro_direction_alignment"]
+            note_l1 = "✅" if l1 < 0.10 else ("⚠️" if l1 < 0.20 else "❌")
+            note_dir = "✅" if abs(pro_dir) < 0.30 else "⚠️"
+            note = f"{note_l1}{note_dir}"
+            display = label + (" (ref)" if label == "_1_stage1_recon" else "")
+            if label == "_1_stage1_recon":
+                note = "(ref)"
+            m4_rows.append([
+                display,
+                f"{l1:.3f}",
+                f"{pro_dir:+.2f}",
+                f"{m['temporal_diff_ratio_mel_extra']:+.2f}",
+                f"{m['hf_energy_increase_extra']:+.2f}",
+                note,
+            ])
+        lines.extend(render_table(m4_headers, m4_rows))
+        lines.append("")
+
+    # ── §3. Best step 推薦(以 VV 為準)──
+    if vv_keys and step_labels:
+        # 排除 _1_stage1_recon 跟 step005000(post-warmup chaos)
+        candidate_steps = [s for s in step_labels if s != "step005000"]
+        scored = []
+        for s in candidate_steps:
+            m = mean_over_samples(vv_keys, s)
+            if not m:
+                continue
+            scored.append((s, m["pro_direction_alignment"], m))
+        if scored:
+            scored.sort(key=lambda x: x[1], reverse=True)
+            best_step, best_align, best_m = scored[0]
+            lines.append("## 3. Best step 推薦(以 VV `pro_direction_alignment` 排序)\n")
+            lines.append(f"⭐ **`{best_step}` 為 VV 上 alignment 最高**:")
+            lines.append(f"- `pro_direction_alignment` = **{best_align:+.3f}**")
+            lines.append(f"- `unvoiced_concentration` = {best_m['unvoiced_concentration']:.3f} "
+                         f"{verdict('unvoiced_concentration', best_m['unvoiced_concentration'])}")
+            lines.append(f"- `voiced_spectral_ratio`  = {best_m['voiced_spectral_ratio']:.3f} "
+                         f"{verdict('voiced_spectral_ratio', best_m['voiced_spectral_ratio'])}")
+            lines.append(f"- `tdr_extra` = {best_m['temporal_diff_ratio_mel_extra']:+.3f} "
+                         f"{verdict('temporal_diff_ratio_mel_extra', best_m['temporal_diff_ratio_mel_extra'])}")
+            lines.append(f"- `hf_extra`  = {best_m['hf_energy_increase_extra']:+.3f} "
+                         f"{verdict('hf_energy_increase_extra', best_m['hf_energy_increase_extra'])}")
+            # 也列前 3 名給比較
+            if len(scored) >= 2:
+                lines.append("")
+                lines.append("Top 3 by VV alignment:")
+                for s, a, _ in scored[:3]:
+                    lines.append(f"  - {s}: {a:+.3f}")
+            lines.append("")
+            lines.append("> 排除了 `_1_stage1_recon`(baseline)跟 `step005000`(D_z warmup 結束 post-chaos)。")
+            lines.append("> 「best」之外仍需聽測佐證:`pro_direction_alignment` 只看 envelope 平均方向,"
+                         "不包括時間動態與咬字(詳 [eval_metrics_guide.md §2.B](../../docs/eval_metrics_guide.md))。")
+            lines.append("")
+
+    # ── §4. M4 vs VV ratio(amateur-specificity sanity check)──
     if m4_keys and vv_keys and step_labels:
         last_step = step_labels[-1]
         m_m4 = mean_over_samples(m4_keys, last_step)
         m_vv = mean_over_samples(vv_keys, last_step)
         if m_m4 and m_vv:
-            lines.append(f"## M4 (pro control) vs VV (amateur) @ {last_step}\n")
-            lines.append("以 pro control 對比 amateur 修飾,判斷 M 是否 amateur-specific:")
-            lines.append(f"- M4 sample 的 L1_recon = **{m_m4['mel_l1_vs_recon']:.3f}** "
-                         f"(M 對 pro 的 noise floor)")
-            lines.append(f"- VV sample 的 L1_recon = **{m_vv['mel_l1_vs_recon']:.3f}** "
-                         f"(M 對 amateur 的整體修飾)")
+            lines.append(f"## 4. M4 vs VV L1_recon ratio @ {last_step} — amateur-specificity\n")
+            lines.append("M 對 pro / amateur 修飾量比,確認 M 不是「對所有輸入都做固定修飾」:")
+            lines.append(f"- M4 (pro control) L1_recon = **{m_m4['mel_l1_vs_recon']:.3f}**(M 對 pro 的 noise floor)")
+            lines.append(f"- VV (amateur)     L1_recon = **{m_vv['mel_l1_vs_recon']:.3f}**(M 對 amateur 的整體修飾)")
             ratio = m_vv["mel_l1_vs_recon"] / max(m_m4["mel_l1_vs_recon"], 1e-6)
-            lines.append(f"- ratio (VV / M4)     = **{ratio:.2f}×**")
+            lines.append(f"- **ratio (VV / M4) = {ratio:.2f}×**")
             if ratio > 2.0:
-                lines.append("\n→ M 對 amateur 修飾 **顯著大於** 對 pro 的 noise floor: "
-                             "**amateur-specific behavior ✅** (L_id_pro 工作中)")
+                lines.append("\n→ M 對 amateur 修飾 **顯著大於** pro noise floor:"
+                             "**amateur-specific ✅**(L_id_pro 工作中)")
             elif ratio > 1.2:
-                lines.append("\n→ M 對 amateur 修飾稍大於 pro: 有 amateur-specific 趨勢,但弱")
+                lines.append("\n→ ratio 微弱:M 對 amateur 稍重於 pro,但**邊界 ⚠️**")
             else:
-                lines.append("\n→ M 對 amateur 跟 pro 的修飾差不多: "
-                             "**M 可能是固定修飾不分輸入**(mode collapse 雛形或 L_id_pro 失效) ⚠️")
+                lines.append("\n→ ratio ≈ 1:M 對 amateur 跟 pro 修飾差不多 → "
+                             "**mode collapse 雛形或 L_id_pro 失效 ❌**")
             lines.append("")
 
     # ── per-sample 索引 ──
