@@ -9,6 +9,9 @@
 # 在 setup 時下載。若 commit 進 repo,會產生雞生蛋邏輯(指向 commit X 的 file 在 commit X 內)
 COMMIT_HASH.txt
 
+# 論文 LaTeX 專案,獨立工作流,不跟模型程式碼一起 version control
+/thesis/
+
 # Python
 __pycache__/
 *.py[cod]
