@@ -1255,3 +1255,51 @@ PYTHONPATH=. python -m scripts.infer ... \
     --pro-ref path/to/pro_reference.wav \
     --output outputs/mode_b_result.wav
 ```
+
+---
+
+## 附錄 A：PopBuTFy 跨語言驗證流程（thesis §4.6）
+
+NSVB-ZH 架構設計為 language-agnostic。為驗證跨語言通用性，我們在 NSVB 原版所附的
+英文 **paired** SVB 資料集 PopBuTFy 上重跑相同 Phase 0 + Phase 1/2 pipeline。
+PopBuTFy 提供同歌手同首歌的 amateur/professional 配對 → 補上中文 unpaired 流程
+缺的 **paired metrics**（MCD/SSIM/F0 RMSE vs paired pro）與 **NSVB 原版 ckpt baseline 對照**。
+
+### A.1 資料位置與配對 dump
+
+PopBuTFy 來源（本機）：`<NSVB workspace>/data/processed/PopBuTFy_new/data/`
+- 結構：`{Singer}#singing#{Song}_{Amateur|Professional}/*_{idx}.mp3`
+- 共 ~904 folders = ~452 paired (singer, song) pairs、24 speakers、~14K chunks/side
+
+先用 adapter dump amateur→pro 配對 dict（§4.6 paired eval 直接讀）：
+```bash
+python -m nsvb.data.popbutfy_adapter \
+    --root <NSVB_workspace>/data/processed/PopBuTFy_new/data \
+    --pairing-json outputs/popbutfy_pairing.json
+```
+
+### A.2 Binarize（兩 side 分別跑）
+
+`--data-root` 直接指向 PopBuTFy_new/data 本身（不像 m4/vv 加 subdir）：
+```bash
+PYTHONPATH=. python -m nsvb.data.binarizer --dataset popbutfy_pro \
+    --data-root <NSVB_workspace>/data/processed/PopBuTFy_new/data \
+    --out-root data/binarized
+
+PYTHONPATH=. python -m nsvb.data.binarizer --dataset popbutfy_amateur \
+    --data-root <NSVB_workspace>/data/processed/PopBuTFy_new/data \
+    --out-root data/binarized
+```
+備註：
+- `load_wav` 走 librosa 原生支援 mp3，pipeline 內部處理跟 wav 完全等價
+- Phase 0 gates 仍然要過（SSIM、JSD、cluster MI 等），門檻同中文流程
+- 配對假設 chunk N(amateur) ↔ chunk N(pro)，下游 eval 階段若需 fine-grained 對齊
+  再走 DTW（NSVB 原版做法）
+
+### A.3 訓練與評估
+
+訓練：與中文流程同 `nsvb.task.stage1` / `nsvb.task.stage2` 配方，
+僅 `--amateur-dataset popbutfy_amateur --pro-dataset popbutfy_pro`。
+
+評估：除了既有 unpaired metrics，加跑 paired eval（讀 `outputs/popbutfy_pairing.json`）
+量化 MCD / SSIM / F0 RMSE vs paired pro；同 ckpt 也跑 NSVB 原版作為 baseline。
