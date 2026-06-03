@@ -49,18 +49,55 @@
 
 按「想看 M 的什麼性質」分類。每組指標只解釋設計動機跟健康判讀，公式詳細請看 [scripts/stage2_mel_eval.py](../scripts/stage2_mel_eval.py) `compute_metrics()` 與 [nsvb/task/stage2.py](../nsvb/task/stage2.py) `train_step` / `monitor_audio_quality`。
 
+### 2.0 指標形式 vs 閾值來源(很重要,避免把經驗值當絕對真理)
+
+⚠ **最常見誤解**:把「指標形式是文獻常見的」當成「PASS/FAIL 閾值也是文獻通用硬標」。
+這兩件事是**獨立的兩軸**,必須分開:
+
+**軸 1 — 指標形式**(這個量本身在研究界常不常見):
+| 標記 | 意思 |
+|---|---|
+| **①** Literature-common | 形式在語音 / 歌聲合成研究通用(SSIM、F0 RMSE、MCD、WER/CER、MOS、speaker similarity)。數字可跨專案 / 跟論文比。 |
+| **②** Project proxy | 為 NSVB-ZH 架構 / Risk 設計的指標,文獻沒這東西(`pro_direction_alignment`、`unvoiced_concentration`...)。只在本任務脈絡有意義,不能跟論文比。 |
+
+**軸 2 — 閾值來源**(PASS/FAIL 線哪裡來的):
+| 標記 | 意思 |
+|---|---|
+| **E** Empirical-calibrated | 本專案用 M4Singer+VocalVerse 實驗 / synthetic test 校準。換 dataset 要重校。 |
+| **H** Heuristic | 討論中憑邏輯估的,質性指引,別當定量 ground truth。 |
+
+> **關鍵**:本專案**幾乎沒有「純文獻硬標閾值」** — 連 SSIM≥0.90、F0 RMSE≤10Hz 都是我們的工程 gate(SVS 論文這些閾值各異),所以閾值欄全是 E 或 H,**沒有 L**。指標形式①只代表「量的定義是通用的」,不代表「這條線是論文標準」。
+
+| 指標 | 指標形式 | 閾值 | 閾值來源 | 說明 |
+|---|---|---|---|---|
+| **mel SSIM** (vocoder identity) | ① | ≥ 0.90 PASS,< 0.85 FAIL | **E** | 形式通用(skimage SSIM);閾值是 NSVB `vocoder_identity_test.py` 訂的專案 gate,非論文硬標 |
+| **F0 RMSE** (vocoder identity) | ① | ≤ 10 Hz PASS,> 20 Hz FAIL | **E** | 形式通用(TTS/SVS 常用);≤10Hz 是專案 gate,論文閾值各異 |
+| **Audio quality JSD**(sfm/hf_ratio) | ①形式(JSD)/ 指標本身偏 proxy | < 0.10 | **E** | [Risk 2 L4](../risk.md) audio_quality_probe;< 0.10 依 v1 dereverb response 校準 |
+| **`unvoiced_concentration`** | ② | < 0.55 健康,> 0.65 警訊 | **E** | [stage2.py monitor_audio_quality](../nsvb/task/stage2.py) synthetic test 校準。Random delta ~0.5,>0.65 表 M 異常集中 unvoiced |
+| **`voiced_spectral_ratio`** | ② | ≥ 0.70 健康,< 0.40 警訊 | **E** | 同上 synthetic test:純 envelope shift ≈ 1.0,random noise ≈ 0.2 |
+| **`delta_over_z`** (latent) | ② | 0.03 ~ 0.30 健康 | **E** | [training_flow.md §3.6.1](training_flow.md) v1 訓中校準。**僅訓中 warning,非 hard-fail**(見 §5.1)|
+| **`temporal_diff_ratio` (latent)** | ② | < 0.3 健康,> 1.0 嚴重 | **E** | 同上,僅訓中 warning |
+| **`temporal_diff_ratio_mel_extra`** | ② | < 0.3 健康,> 1.0 嚴重 | **H** | 沿用 latent 閾值,扣 baseline 後 v2 實測 0.03 落 healthy 做錨點 |
+| **`hf_energy_increase_extra`** | ② | ±0.20 / −0.35 / +0.50 | **H** | 討論中定(非對稱:HF 抹掉比加 hiss 難救);v2 -0.18 落邊界 healthy |
+| **`pro_direction_alignment`** | ② | > 0.3 健康,> 0.5 很好,< 0 反向 | **H** | envelope-only proxy(見 §2.B caveat);anchor 來自 v2 |
+| **M4 vs VV `L1_recon` ratio** | ② | > 2× ✅,1.2-2× ⚠,≈ 1 ❌ | **H** | sanity check;v2 是 11.26×,> 2× 是 generous heuristic |
+
+**讀法**:
+- **指標形式 ①** = 數字可跟論文 / 別專案比;**②** = 只在本任務有意義,不能外比
+- **閾值幾乎全是 E / H** → 失敗代表「在本資料集設定下異常」,**不代表「違反公認標準」**;換 dataset 要重校
+- 標 **H** 的(tdr_mel_extra / hf_extra / pro_dir / ratio)→「方向不對」比「數值不及格」重要,單獨踩線別當大事
+
 ### 2.A 修飾幅度 — M 實際改了多少
 
 > ⚠ **名稱注意**：這組指標**反映「M 改了多少」**,但**不能直接證明 content 被保留**。
-> 真正的 content preservation 需要額外指標(PPG similarity / ASR-based CER /
-> phoneme posterior distance / duration alignment 一致性),目前 backlog,尚未實作。
-> 如果未來想驗收「M 沒亂改歌詞」,要新增這組指標,不要把 `mel_l1_vs_recon` 當代理。
+> 真正的 content preservation 需要額外指標(PPG similarity / ASR CER / ...),**見 §6.A backlog**,目前未實作。
+> 不要把 `mel_l1_vs_recon` 低就當「歌詞沒變」。
 
 | 指標 | 直觀含意 | 健康範圍 | 在哪看 |
 |---|---|---|---|
-| `mel_l1_vs_orig` | M+decoder 輸出 vs 原 amateur mel,全部差異總和 | 含 VAE 重建底噪,單看意義有限 | eval `report.md` |
-| `mel_l1_vs_orig_extra` | 上面那項扣掉 baseline,**只剩 M 在 baseline 之上的修飾量** | 0 ~ 0.3 健康(M 在 baseline 之上多動了一些) | eval `report.md` |
-| `mel_l1_vs_recon` | M+decoder 輸出 vs Stage 1 only baseline,**M 的純貢獻** | 訓練開始 ~0,訓中增大但 < 1.0 | eval `report.md` |
+| `mel_l1_vs_orig` | M+decoder 輸出 vs 原 amateur mel,全部差異總和 | 含 VAE 重建底噪,單看意義有限 | per-sample `metrics.json` + aggregate CSV |
+| `mel_l1_vs_orig_extra` | 上面那項扣掉 baseline,**只剩 M 在 baseline 之上的修飾量** | 0 ~ 0.3 健康(M 在 baseline 之上多動了一些) | per-sample `metrics.json` + aggregate CSV |
+| `mel_l1_vs_recon` | M+decoder 輸出 vs Stage 1 only baseline,**M 的純貢獻** | 訓練開始 ~0,訓中增大但 < 1.0 | `report.md` (VV/M4 表) + `metrics.json` |
 | `delta_over_z`(**latent 版本**) | ‖M(z) − z‖ / ‖z‖;M 在 latent 空間動了 z 多少 | 0.03 ~ 0.30 「健康」(文件 §3.6.1) | 訓中 log + summary |
 
 **為什麼有兩個版本（mel 跟 latent）**：
@@ -78,10 +115,10 @@
 
 | 指標 | 直觀含意 | 健康範圍 | 在哪看 |
 |---|---|---|---|
-| `pro_dist_orig` | 原 amateur 樣本 envelope 到 pro 平均的距離 | reference value | eval `report.md`，metrics.json |
-| `pro_dist_out` | M 修飾後 envelope 到 pro 平均的距離 | < `pro_dist_orig` | 同上 |
-| `pro_dist_delta` | = `pro_dist_orig − pro_dist_out`，**修飾把樣本拉近 pro 多少** | **> 0**（正號=往 pro 靠）| 同上 |
-| `pro_direction_alignment` | cos(修飾向量, 從 amateur 走到 pro 的向量)；**1=方向完全對，0=正交，-1=反向** | **> 0.3 健康**, > 0.5 很好, < 0 反向 | 同上 |
+| `pro_dist_orig` | 原 amateur 樣本 envelope 到 pro 平均的距離 | reference value | per-sample `metrics.json` only |
+| `pro_dist_out` | M 修飾後 envelope 到 pro 平均的距離 | < `pro_dist_orig` | per-sample `metrics.json` only |
+| `pro_dist_delta` | = `pro_dist_orig − pro_dist_out`，**修飾把樣本拉近 pro 多少** | **> 0**（正號=往 pro 靠）| `report.md` (VV/M4 表) + `metrics.json` |
+| `pro_direction_alignment` | cos(修飾向量, 從 amateur 走到 pro 的向量)；**1=方向完全對，0=正交，-1=反向** | **> 0.3 健康**, > 0.5 很好, < 0 反向 | `report.md` (VV/M4 表) + `metrics.json` |
 
 **為什麼這組指標關鍵**：
 SVB（singing voice beautification）是「unpaired」任務 — 同一句業餘錄音沒有對應的 pro 版可比。我們不能說「M 應該生成什麼」。**唯一可量化的「對的方向」就是「pro 整體分布的方向」**。
@@ -193,16 +230,23 @@ SVB（singing voice beautification）是「unpaired」任務 — 同一句業餘
 
 **注意**：這份 summary 全部基於 **latent 空間**指標。如本指南 §2.A 所述,latent metric 數值對「實際聽起來」對應差,不要單獨依賴它判訓壞。
 
-### 3.2 mel-domain eval（`outputs/stage2_v2_eval/report.md`）
+### 3.2 mel-domain eval（`outputs/stage2_v*_eval*/report.md`）
 
-讀法順序：
-1. **Per-step aggregate** 表 — 一覽各 step 的平均健康狀態，看每個指標的 ✅/⚠️/❌
-2. **M4 vs VV ratio** — M 是否 amateur-specific（健康 > 2×）
-3. **找 best step**：
-   - `pro_direction_alignment` 越高越好
-   - `mel_l1_vs_recon` 不要太大（修飾不該爆炸）
-   - 各健康指標都 ✅
-4. **per-sample mel_grid.png** — 視覺確認「修飾長相」是否合理
+報告結構分 4 個 section,讀法順序:
+
+1. **§1 VV-only 主表**:全部健康判定的主要依據。VV 是 amateur 推理目標,看每 step 的 ✅/⚠️/❌
+   - `_1_stage1_recon` 列只當 reference(self-vs-self,不打 verdict)
+2. **§2 M4 control 表**:確認 M 對 pro 沒過度修飾。判定標準**不同**:
+   - `L1_recon` 應極小(< 0.10 ✅,< 0.20 ⚠️,> 0.20 ❌:L_id_pro 失效)
+   - `pro_dir` 接近 0(M 對 pro 不應該繼續推往 pro;> +0.30 ⚠️)
+3. **§3 Best step 推薦**:script 自動依 VV `pro_direction_alignment` 排序挑 best,排除 baseline 跟 post-warmup chaos step
+4. **§4 M4 vs VV ratio**:amateur-specificity sanity check;ratio > 2× ✅,≈ 1 ❌(mode collapse 警訊)
+
+per-sample mel_grid.png 在報告末段索引,**視覺確認「修飾長相」是否合理**(看 5-10 張代表性的就夠)。
+
+> **為什麼以前 mixing M4 + VV 算平均很糟**:M4 L1_recon ≈ 0.05、VV L1_recon ≈ 0.54,
+> 混合平均 0.35 既不代表 pro control 也不代表 amateur 真實品質。新報告分開算 verdict
+> 才有意義。
 
 ### 3.3 mel_grid.png 視覺判讀
 
@@ -292,11 +336,12 @@ v2 經驗：mel 域指標顯示 **step 30000** 是 alignment 最高（+0.74）�
 
 ## 5. 易混淆點 / 重要 caveat
 
-### 5.1 latent 指標 vs mel 指標常衝突
+### 5.1 latent 指標 vs mel 指標常衝突（latent 只當訓中 warning,不作 hard-fail）
 
 - `delta_over_z` 0.87（latent）跟 `mel_l1_vs_recon` 0.46（mel） 不可直接比。
 - latent metric 受 latent 維度 scale 影響大，**單獨用它判好壞會誤判**。
-- 經驗：以 mel 指標為主、latent 指標只當訓中即時警報。
+- **明確規則**：`delta_over_z` / latent `temporal_diff_ratio` **只當訓中即時 warning（看 M 有沒有暴走），不作最終品質 hard-fail**。v2 經驗:latent 看起來 0.87「過度修飾」很嚴重,mel-domain eval 卻顯示輸出合理。最終驗收看 mel-domain `_extra`。
+- mel 域也優先看 `_extra` 版（`temporal_diff_ratio_mel_extra` / `hf_energy_increase_extra`）：扣掉 Stage 1 VAE 重建底噪才是 M 的真實貢獻;看 absolute value 會把 VAE 噪音誤判成 M 的問題。
 
 ### 5.2 baseline（`_1_stage1_recon`）本身有 VAE 重建誤差
 
@@ -329,19 +374,56 @@ v2 經驗：mel 域指標顯示 **step 30000** 是 alignment 最高（+0.74）�
 ### 5.7 mel_l1_vs_recon ≠ content preservation
 
 `mel_l1_vs_recon` 只代表「M 在 mel domain 改了多少」,**不能直接證明歌詞/咬字/旋律被保留**。
-真正驗證 content 保留需要的指標(目前 backlog,未實作):
-
-- **PPG similarity**: 對 GT mel 跟 output mel 各抽 PPG(Whisper hidden state),算 cosine sim;低 → 咬字 / 音素變了
-- **ASR / lyrics CER**: 對 wav 跑 Whisper ASR,跟原始歌詞算 CER;高 → 歌詞被改寫
-- **Phoneme posterior distance**: 對 PPG 序列做 phoneme-level alignment 差異
-- **Duration / alignment consistency**: 用 DTW 對齊 GT / output,看 phoneme 邊界偏移
-
-未來若要正式驗收「M 沒亂改歌詞」,該補這組指標,**不要把 `mel_l1_vs_recon` 低就當 content 保留**。
-(目前 v2 的 `mel_l1_vs_recon ~0.5` 直觀上「M 修飾不大」,但邏輯上不能保證歌詞沒變。我們靠耳朵聽測補這個盲點。)
+真正驗證 content 保留要 PPG similarity / ASR CER 等 → **見 §6.A backlog（含實作成本 + vocoder 阻塞說明）**。
+(v2 `mel_l1_vs_recon ~0.5` 直觀上「修飾不大」,但邏輯上不保證歌詞沒變;目前靠聽測補盲點。)
 
 ---
 
-## 6. 想再深入的話
+## 6. 文獻常見但尚未實作的評估面向（backlog）
+
+目前評估系統能回答「M 是否往 pro envelope 修飾 / 主要改 voiced / 避免 Risk 2 / 對 amateur 比 pro 更有反應」,但**離聲音合成研究的完整評估還缺四類**。下面列出 + 標優先級。
+
+> 🔴 **共同前提:大多需要 output wav** → 受 [Risk 10 vocoder 問題](../risk.md) 阻塞。
+> 目前 amateur 端 vocoder 輸出有電音,output-side 指標會量到 vocoder 汙染,不準。
+> **這些大多要等 vocoder 修好才能乾淨地跑**;在那之前 mel-domain proxy 是天花板。
+
+### A. Content preservation（M 不該改歌詞/咬字）
+| 指標 | 形式 | 成本 | vocoder 阻塞? |
+|---|---|---|---|
+| **PPG cosine sim(input, output)** | ① | 低(pipeline 已有 Whisper PPG)| 是(需 output wav 抽 PPG)|
+| Whisper ASR CER / lyrics CER | ① | 中(需歌詞 ground truth;VocalVerse 未必有)| 是 |
+| phoneme_id sequence agreement | ② | 低(已有 phoneme_id)| 是 |
+| PPG DTW alignment cost | ① | 中 | 是 |
+→ **最該補的一組**(SVB 核心目標是不改 content)。最便宜:PPG cosine sim。
+
+### B. Singer identity preservation（Risk 4:音色不該漂向 M4 pro）
+| 指標 | 形式 | 成本 | vocoder 阻塞? |
+|---|---|---|---|
+| **speaker embedding cosine(input, output)** | ① | 低(pipeline 已有 Resemblyzer)| 是 |
+| spk cosine(output, nearest pro speaker) | ① | 低 | 是 |
+| SMOS / singer similarity MOS | ①(主觀)| 高(需評審)| 是 |
+→ 直接量 Risk 4。最便宜:spk_emb cosine。
+
+### C. F0 preservation / pitch behavior（Mode A 不該改 F0）
+| 指標 | 形式 | 成本 | 備註 |
+|---|---|---|---|
+| F0 RMSE / log-F0 RMSE(input, output) | ① | 低 | ⚠ Mode A 的 F0 是 decoder 條件,**理論上不變** → 此指標主要量 vocoder F0 還原,不是量 M |
+| F0 Pearson / V-UV error | ① | 低 | 同上 caveat |
+| vibrato rate / extent drift | ① | 中 | 較能反映 M 是否動到顫音(但顫音在 z 不在 F0 條件,值得測)|
+→ **優先級低**:Mode A F0 由條件鎖定,RMSE 主要反映 vocoder。vibrato drift 才有測 M 的價值。
+
+### D. Subjective evaluation（最終仲裁）
+| 指標 | 成本 | 備註 |
+|---|---|---|
+| AB preference(orig vs output 誰唱得更好)| 高 | 最直接回答「有沒有變好」|
+| Naturalness MOS / Artifact rating / Singer similarity MOS | 高 | 需 5-10 評審 |
+→ **vocoder 修好 + Phase 3 demo 後才有意義**;客觀指標再多都不能取代。
+
+**實作順序建議**(等 vocoder 可用後):先 A(PPG cosine)+ B(spk cosine)——兩者最便宜且 pipeline 已有抽取器,各約 ~50 行加進 `stage2_mel_eval` 的 wav-output 模式;再 C(vibrato drift);最後 D(主觀,需人力)。
+
+---
+
+## 7. 想再深入的話
 
 | 想了解 | 看哪份文件 |
 |---|---|
