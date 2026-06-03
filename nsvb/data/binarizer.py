@@ -404,6 +404,11 @@ def run_binarize(
         samples = list_m4singer(dataset_root)
     elif dataset_name == "vocalverse":
         samples = list_vocalverse(dataset_root)
+    elif dataset_name in ("popbutfy_pro", "popbutfy_amateur"):
+        # 跨語言驗證(thesis §4.6):英文 paired SVB dataset,走同 Phase 0 pipeline
+        from nsvb.data.popbutfy_adapter import list_popbutfy
+        side = dataset_name.split("_", 1)[1]  # "pro" or "amateur"
+        samples = list_popbutfy(dataset_root, side)
     else:
         raise ValueError(f"Unknown dataset_name: {dataset_name}")
 
@@ -524,15 +529,23 @@ def main():
     用法：
         python -m nsvb.data.binarizer --dataset m4singer
         python -m nsvb.data.binarizer --dataset vocalverse --max-samples 5  # debug
+        # 跨語言驗證(英文 paired):pro 跟 amateur 分兩次跑
+        python -m nsvb.data.binarizer --dataset popbutfy_pro \
+            --data-root c:/Users/neo29/workspace/SVC/NSVB/data/processed/PopBuTFy_new/data
+        python -m nsvb.data.binarizer --dataset popbutfy_amateur \
+            --data-root c:/Users/neo29/workspace/SVC/NSVB/data/processed/PopBuTFy_new/data
     """
     parser = argparse.ArgumentParser(description="NSVB-ZH Phase 0 binarizer")
     parser.add_argument(
-        "--dataset", choices=["m4singer", "vocalverse"], required=True,
+        "--dataset",
+        choices=["m4singer", "vocalverse", "popbutfy_pro", "popbutfy_amateur"],
+        required=True,
         help="Which dataset to process",
     )
     parser.add_argument(
         "--data-root", default="data",
-        help="Root containing m4singer/ and VocalVerse/",
+        help="Root containing m4singer/ and VocalVerse/。"
+             "若 --dataset popbutfy_* → 直接指向 PopBuTFy_new/data 本身(不加 subdir)",
     )
     parser.add_argument(
         "--out-root", default="data/binarized",
@@ -627,13 +640,16 @@ def main():
     )
     args = parser.parse_args()
 
-    # 對應 data 目錄的實際資料夾名（M4Singer 大小寫敏感）
-    dataset_dir_name = {
-        "m4singer": "m4singer",
-        "vocalverse": "VocalVerse",
-    }[args.dataset]
-
-    dataset_root = Path(args.data_root) / dataset_dir_name
+    # 對應 data 目錄的實際資料夾名（M4Singer 大小寫敏感）。
+    # popbutfy_* 的 data_root 已是 PopBuTFy_new/data 本身,不再加 subdir。
+    if args.dataset in ("popbutfy_pro", "popbutfy_amateur"):
+        dataset_root = Path(args.data_root)
+    else:
+        dataset_dir_name = {
+            "m4singer": "m4singer",
+            "vocalverse": "VocalVerse",
+        }[args.dataset]
+        dataset_root = Path(args.data_root) / dataset_dir_name
     if not dataset_root.is_dir():
         print(f"ERROR: dataset root not found: {dataset_root}")
         sys.exit(1)
