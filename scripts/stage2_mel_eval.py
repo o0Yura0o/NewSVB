@@ -225,7 +225,7 @@ def compute_pro_mean_env(binarized_root: Path, pro_dataset: str, n: int,
     pro_dir = binarized_root / pro_dataset
     if split_file is not None:
         # 只取 split file 內列出的 pro samples(避免 test self-contamination)
-        items = [s.strip() for s in Path(split_file).read_text().splitlines() if s.strip()]
+        items = [s.strip() for s in Path(split_file).read_text(encoding="utf-8").splitlines() if s.strip()]
         npz_files = [pro_dir / f"{item}.npz" for item in items]
         npz_files = [p for p in npz_files if p.exists()]
         print(f"[pro_mean] split-filtered ({split_file.name}): "
@@ -334,7 +334,7 @@ def run_fresh_inference(args) -> dict:
         load_svbvae, load_M, load_vocoder, run_mode_a, find_npz,
     )
     binarized_root = Path(args.binarized_root)
-    val_list = [s.strip() for s in Path(args.val_split).read_text().splitlines() if s.strip()]
+    val_list = [s.strip() for s in Path(args.val_split).read_text(encoding="utf-8").splitlines() if s.strip()]
     val_vv = [v for v in val_list if "__c" in v]
     val_m4 = [v for v in val_list if "#" in v and v not in val_vv]
 
