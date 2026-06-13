@@ -84,7 +84,7 @@ class BinarizedNSVBDataset(Dataset):
         # set 是 O(1) per check
         if split_file is not None:
             split_path = Path(split_file)
-            with open(split_path) as f:
+            with open(split_path, encoding="utf-8") as f:
                 allowed = {line.strip() for line in f if line.strip()}
             candidate_paths = [p for p in candidate_paths if p.stem in allowed]
             if not candidate_paths:
