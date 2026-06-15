@@ -53,7 +53,7 @@ def _pick_val_samples(
     seed: int = 42,
 ) -> list[Path]:
     """從 val split 抽 N 個樣本,1/4 M4(pro control)+ 3/4 VV(amateur 主訊號)。"""
-    val_list = [s.strip() for s in val_split_file.read_text().splitlines() if s.strip()]
+    val_list = [s.strip() for s in val_split_file.read_text(encoding="utf-8").splitlines() if s.strip()]
     val_vv = [v for v in val_list if "__c" in v]
     val_m4 = [v for v in val_list if "#" in v and v not in val_vv]
 
@@ -82,7 +82,7 @@ def _compute_pro_mean_env(
     """從 pro dataset(train split 內若 train_split_file 給了)抽 N sample 算 mean envelope。"""
     pro_dir = binarized_root / pro_dataset
     if train_split_file is not None and train_split_file.exists():
-        items = [s.strip() for s in train_split_file.read_text().splitlines() if s.strip()]
+        items = [s.strip() for s in train_split_file.read_text(encoding="utf-8").splitlines() if s.strip()]
         candidate = [pro_dir / f"{item}.npz" for item in items]
         candidate = [p for p in candidate if p.exists()]
     else:
