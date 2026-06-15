@@ -24,7 +24,10 @@ from statistics import mean
 from typing import Optional
 
 # ── 訓練 log 列(由 stage2.py train_step log 印出) ──
-# format: [step  12345 5.4it/s] m_total=.. d_z=.. d_mel=.. l_nce=.. l_adv_z=.. l_adv_mel=.. l_id_pro=.. delta_over_z=.. temporal_diff_ratio=..
+# format: [step  12345 5.4it/s] m_total=.. d_z=.. d_mel=.. l_nce=.. l_adv_z=..
+#         l_adv_mel=.. [l_pro_match=..] l_id_pro=.. delta_over_z=.. temporal_diff_ratio=..
+# 為什麼 l_pro_match 用 (?:...)?:此欄是後加入的(predicate v3 後),舊 log 沒這欄,
+# 用 optional non-capturing group 確保新舊 log 都能 parse;v2-style config 此值恆 0.0
 STEP_RE = re.compile(
     r"\[step\s+(\d+)\s+([\d.]+)it/s\]\s+"
     r"m_total=(-?[\d.]+)\s+"
@@ -33,6 +36,7 @@ STEP_RE = re.compile(
     r"l_nce=(-?[\d.]+)\s+"
     r"l_adv_z=(-?[\d.]+)\s+"
     r"l_adv_mel=(-?[\d.]+)\s+"
+    r"(?:l_pro_match=-?[\d.]+\s+)?"
     r"l_id_pro=(-?[\d.]+)\s+"
     r"delta_over_z=(-?[\d.]+)\s+"
     r"temporal_diff_ratio=(-?[\d.]+)"

@@ -134,8 +134,8 @@ def load_vocoder(vocoder_ckpt_path: str, device: str) -> HifiGanNSFGenerator:
 
 
 def find_npz(item_id: str, binarized_root: Path):
-    """找 item_id 對應的 .npz(可能在 m4singer/ 或 vocalverse/)。"""
-    for ds in ('m4singer', 'vocalverse'):
+    """找 item_id 對應的 .npz。掃 v2 之 M4+VV 與 PopBuTFy 跨語言驗證之兩 side。"""
+    for ds in ('m4singer', 'vocalverse', 'popbutfy_amateur', 'popbutfy_pro'):
         p = binarized_root / ds / f'{item_id}.npz'
         if p.exists():
             return p, ds
@@ -245,10 +245,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     binarized_root = Path(args.binarized_root)
 
-    # 抽樣:bias 偏 VocalVerse(amateur 是聽測重點);--all-samples 時改取全部
-    val_list = [s.strip() for s in Path(args.val_split).read_text().splitlines() if s.strip()]
-    val_vv = [v for v in val_list if '__c' in v]
-    val_m4 = [v for v in val_list if '#' in v and v not in val_vv]
+    # 抽樣:bias 偏 amateur(amateur 是聽測重點);--all-samples 時改取全部
+    # 雙 corpus 偵測:v2 之 VV(amateur)用 __c 後綴,M4(pro)用 singer#song;
+    # PopBuTFy 兩 side 都帶 #singing# + _Amateur_ / _Professional_ 後綴。
+    val_list = [s.strip() for s in Path(args.val_split).read_text(encoding="utf-8").splitlines() if s.strip()]
+    val_vv = [v for v in val_list if '__c' in v or '_Amateur_' in v]
+    val_m4 = [v for v in val_list if v not in val_vv and '#' in v]
 
     random.seed(args.seed)
     if args.all_samples:

@@ -42,7 +42,7 @@ CKPT_DIR    = REPO / "checkpoints" / "stage2_popbutfy"
 LOG_DIR     = REPO / "logs"
 STAGE1_CKPT = "checkpoints/stage1/stage1_best.pt"
 
-NUM_WORKERS = 4  # v2 colab cell 用 4;若 Windows DataLoader 卡頓改 2
+NUM_WORKERS = 2  # v2 colab cell 用 4;若 Windows DataLoader 卡頓改 2
 
 
 def main():

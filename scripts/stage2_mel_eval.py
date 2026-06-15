@@ -335,8 +335,11 @@ def run_fresh_inference(args) -> dict:
     )
     binarized_root = Path(args.binarized_root)
     val_list = [s.strip() for s in Path(args.val_split).read_text(encoding="utf-8").splitlines() if s.strip()]
-    val_vv = [v for v in val_list if "__c" in v]
-    val_m4 = [v for v in val_list if "#" in v and v not in val_vv]
+    # 雙 corpus 偵測:v2 之 VV(amateur)用 `__c` chunk 後綴,M4(pro)用 singer#song;
+    # PopBuTFy 兩 side 都帶 `#singing#` + `_Amateur_` / `_Professional_` 後綴。
+    # 各自路由:val_vv 收所有 amateur 角色,val_m4 收所有 pro 角色。
+    val_vv = [v for v in val_list if "__c" in v or "_Amateur_" in v]
+    val_m4 = [v for v in val_list if v not in val_vv and "#" in v]
 
     rng = random.Random(args.seed)
     n_vv = max(args.n_samples - 1, 1)
@@ -419,9 +422,12 @@ def aggregate_and_report(per_sample: dict, out_dir: Path):
                 row = [s_key, label] + [f"{m.get(k, 0):.4f}" for k in metric_keys]
                 w.writerow(row)
 
-    # ── M4 vs VV 分組 ──
-    m4_keys = [k for k in per_sample if k.startswith("m4singer_")]
-    vv_keys = [k for k in per_sample if k.startswith("vocalverse_")]
+    # ── M4 vs VV 分組(v2)或 popbutfy_pro vs popbutfy_amateur(跨語言驗證)──
+    # sample_key 之命名來自 find_npz 之 dataset name(見 run_fresh_inference)
+    m4_keys = [k for k in per_sample
+               if k.startswith("m4singer_") or k.startswith("popbutfy_pro_")]
+    vv_keys = [k for k in per_sample
+               if k.startswith("vocalverse_") or k.startswith("popbutfy_amateur_")]
 
     def mean_over_samples(group_keys: list, label: str) -> dict:
         items = [per_sample[k][label] for k in group_keys if label in per_sample[k]]
@@ -653,8 +659,10 @@ def main():
     # 共用
     ap.add_argument("--binarized-root", required=True,
                     help="包含 m4singer/ vocalverse/ 的 binarized 目錄")
-    ap.add_argument("--pro-dataset", default="m4singer", choices=["m4singer", "vocalverse"],
-                    help="pro 端用哪個 dataset 算 mean envelope 參考(預設 m4singer)")
+    ap.add_argument("--pro-dataset", default="m4singer",
+                    choices=["m4singer", "vocalverse", "popbutfy_pro", "popbutfy_amateur"],
+                    help="pro 端用哪個 dataset 算 mean envelope 參考(預設 m4singer;"
+                         "PopBuTFy 跨語言驗證用 popbutfy_pro)")
     ap.add_argument("--pro-mean-n", type=int, default=100,
                     help="採樣多少 pro samples 算 pro mean envelope。預設 100(spot check 夠);"
                          "full test set eval 建議 500(SEM 從 ~10%% 降到 ~4.5%%)。"
@@ -676,10 +684,13 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. pro mean envelope ──
-    # split_file 邏輯:用戶指定 > 自動偵測 train.txt > None(用全 dataset)
+    # split_file 邏輯:用戶指定 > 自動偵測 train.txt(依 pro_dataset 切 popbutfy 或 v2)> None
     pro_split = Path(args.pro_split_file) if args.pro_split_file else None
     if pro_split is None:
-        auto_train = Path(args.binarized_root) / "splits" / "train.txt"
+        # PopBuTFy 之 train.txt 在 splits_popbutfy/;v2 在 splits/
+        is_popbutfy = args.pro_dataset.startswith("popbutfy")
+        auto_dir = "splits_popbutfy" if is_popbutfy else "splits"
+        auto_train = Path(args.binarized_root) / auto_dir / "train.txt"
         if auto_train.exists():
             pro_split = auto_train
             print(f"[pro_mean] auto-using {pro_split} to avoid test contamination")
@@ -719,8 +730,10 @@ def main():
     elif args.max_viz < 0:
         viz_keys = set(all_keys)
     else:
-        m4_first = [k for k in all_keys if k.startswith("m4singer_")]
-        vv_first = [k for k in all_keys if k.startswith("vocalverse_")]
+        m4_first = [k for k in all_keys
+                    if k.startswith("m4singer_") or k.startswith("popbutfy_pro_")]
+        vv_first = [k for k in all_keys
+                    if k.startswith("vocalverse_") or k.startswith("popbutfy_amateur_")]
         # 平均分配 viz quota:M4 半 / VV 半
         n_m4 = min(len(m4_first), args.max_viz // 2)
         n_vv = min(len(vv_first), args.max_viz - n_m4)
